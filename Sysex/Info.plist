@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>en</string>
+	<key>CFBundleDisplayName</key><string>NetProxyExtension</string>
+	<key>CFBundleExecutable</key><string>netproxy-extension</string>
+	<key>CFBundleIdentifier</key><string>local.netproxy.extension</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>netproxy-extension</string>
+	<key>CFBundlePackageType</key><string>SYSX</string>
+	<key>CFBundleShortVersionString</key><string>1.0</string>
+	<key>CFBundleVersion</key><string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array><string>MacOSX</string></array>
+	<key>LSMinimumSystemVersion</key><string>11.0</string>
+	<key>NSSystemExtensionUsageDescription</key>
+	<string>NetProxy needs to intercept outbound traffic of selected processes to forward it to its upstream proxy.</string>
+	<key>NetworkExtension</key>
+	<dict>
+		<key>NEMachServiceName</key>
+		<string>local.netproxy.extension</string>
+		<key>NEProviderClasses</key>
+		<dict>
+			<key>com.apple.networkextension.app-proxy</key>
+			<string>Provider</string>
+		</dict>
+	</dict>
+</dict>
+</plist>
