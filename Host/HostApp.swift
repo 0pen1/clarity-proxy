@@ -257,6 +257,36 @@ enum ProxyCtl {
             // ---- 防假成功三件套（真机教训：proxy started/status:3 都会骗人）----
             // 1. start 前清场：扩展进程存活且年龄 > 90s（不可能属于本次 start
             //    生命周期）时，NESM 会复用它——新配置不会加载。提示并给出杀进程命令。
+            // ---- 热更新快路径：provider 已 connected 时 sendMessage 推全量新配置，
+            // 不重启隧道、不碰 NESM 状态机——绕开"加 pid 必须 sudo kill 扩展进程"
+            // 的循环（真机两天 5 次事故的根治）。冷启（未连接）才走 startVPNTunnel。
+            if manager.connection.status == .connected,
+               let session = manager.connection as? NETunnelProviderSession {
+                let msg: [String: Any] = ["type": "config", "config": conf]
+                if let data = try? JSONSerialization.data(withJSONObject: msg, options: []) {
+                    // completion 版包装为 async（async 重载与 completion 版签名有歧义）。
+                    let ackData: Data? = await withCheckedContinuation { cont in
+                        do {
+                            try session.sendProviderMessage(data) { resp in
+                                cont.resume(returning: resp)
+                            }
+                        } catch {
+                            cont.resume(returning: nil)
+                        }
+                    }
+                    if let ack = ackData,
+                       let ackObj = try? JSONSerialization.jsonObject(with: ack, options: []),
+                       let ackDict = ackObj as? [String: Any],
+                       ackDict["ok"] as? Bool == true {
+                        print("✓ hot-reloaded (match: \(ackDict["match"] ?? "?")) — provider 未重启，规则即时生效")
+                        print("  (pids=\(mergedPids) include=\(mergedInclude) tree=\(effTreeMode))")
+                        return
+                    }
+                    // sendMessage 失败（provider 进程死/旧版本不识别消息）——落回冷启路径。
+                    print("⚠️  sendMessage 热更未获回执——回退到重启隧道路径")
+                }
+            }
+
             await ProxyCtl.checkStaleProvider()
 
             try manager.connection.startVPNTunnel()

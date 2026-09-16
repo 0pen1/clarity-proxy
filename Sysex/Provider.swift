@@ -499,21 +499,7 @@ class Provider: BaseProvider {
 
     override func startProxy(options: [String: Any]? = nil) async throws {
         if let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration {
-            if let inc = conf["includeProcessPaths"] as? [String] { filter.includePaths = inc }
-            if let exc = conf["excludeProcessPaths"] as? [String] { filter.excludePaths = exc }
-            if let m = conf["upstreamMode"] as? String { upstreamMode = m }
-            if let h = conf["upstreamHost"] as? String { socksHost = h }
-            if let p = conf["upstreamPort"] as? Int { socksPort = UInt16(clamping: p) }
-            if let s = conf["ipcPath"] as? String, !s.isEmpty { ipcPath = s }
-            if let h = conf["ipcHost"] as? String, !h.isEmpty { ipcHost = h }
-            if let p = conf["ipcPort"] as? Int, p > 0 { ipcPort = UInt16(clamping: p) }
-            if let t = conf["treeMode"] as? Bool { filter.treeMode = t }
-            else if let t = conf["treeMode"] as? Int { filter.treeMode = (t != 0) }
-            if let pids = conf["includePids"] as? [Int] {
-                filter.includePids = pids.map { UInt32(clamping: max(0, $0)) }
-            } else if let pids = conf["includePids"] as? [NSNumber] {
-                filter.includePids = pids.map { $0.uint32Value }
-            }
+            applyConfig(conf)
         }
         let modeDesc: String
         if !filter.includePids.isEmpty { modeDesc = "pid:\(filter.includePids)" }
@@ -537,6 +523,64 @@ class Provider: BaseProvider {
                 protocol: .any, direction: .outbound),
         ]
         try await setTunnelNetworkSettings(settings)
+    }
+
+    /// providerConfiguration → 内存规则（startProxy 冷启与 handleAppMessage 热更共用）。
+    private func applyConfig(_ conf: [String: Any]) {
+        if let inc = conf["includeProcessPaths"] as? [String] { filter.includePaths = inc }
+        if let exc = conf["excludeProcessPaths"] as? [String] { filter.excludePaths = exc }
+        if let m = conf["upstreamMode"] as? String { upstreamMode = m }
+        if let h = conf["upstreamHost"] as? String { socksHost = h }
+        if let p = conf["upstreamPort"] as? Int { socksPort = UInt16(clamping: p) }
+        if let s = conf["ipcPath"] as? String, !s.isEmpty { ipcPath = s }
+        if let h = conf["ipcHost"] as? String, !h.isEmpty { ipcHost = h }
+        if let p = conf["ipcPort"] as? Int, p > 0 { ipcPort = UInt16(clamping: p) }
+        if let t = conf["treeMode"] as? Bool { filter.treeMode = t }
+        else if let t = conf["treeMode"] as? Int { filter.treeMode = (t != 0) }
+        if let pids = conf["includePids"] as? [Int] {
+            filter.includePids = pids.map { UInt32(clamping: max(0, $0)) }
+        } else if let pids = conf["includePids"] as? [NSNumber] {
+            filter.includePids = pids.map { $0.uint32Value }
+        }
+    }
+
+    /// 运行时热更新（NEProvider.sendMessage 通道）：Host CLI 把**全量**新配置字典
+    /// 推给活着的 provider——不重启进程、不碰 NESM 状态机，加/删 pid 从此绕开
+    /// "必须 sudo kill 扩展进程"的循环（真机两天 5 次事故的根治）。
+    /// 热更只改内存 FilterRule；持久化由 Host CLI 的 saveToPreferences 负责
+    /// （冷启时 startProxy 仍从 providerConfiguration 读）。
+    override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
+        handleAppMessageBody(messageData) { ack in
+            completionHandler?(ack)
+        }
+    }
+
+    /// 热更处理体（独立函数，completion 形态由上面的官方 override 调用）。
+    private func handleAppMessageBody(_ messageData: Data, completion: @escaping (Data?) -> Void) {
+        // 消息形态：{"type":"config","config":{...providerConfiguration 形态...}}。
+        // 手动 JSONSerialization 解析（providerConfiguration 本就是 plist 混合类型）。
+        guard let obj = try? JSONSerialization.jsonObject(with: messageData, options: []),
+              let dict = obj as? [String: Any],
+              dict["type"] as? String == "config",
+              let conf = dict["config"] as? [String: Any] else {
+            log.error("handleAppMessage: unrecognized message")
+            completion(Data("{}".utf8))
+            return
+        }
+        applyConfig(conf)
+        let modeDesc: String
+        if !filter.includePids.isEmpty { modeDesc = "pid:\(filter.includePids)" }
+        else if filter.treeMode { modeDesc = "tree" }
+        else { modeDesc = "flat" }
+        log.info("hot-reloaded: mode=\(self.upstreamMode, privacy: .public) match=\(modeDesc, privacy: .public) include=\(self.filter.includePaths, privacy: .public) exclude=\(self.filter.excludePaths, privacy: .public) ipc=\(self.ipcPath ?? self.ipcHost.map { "\($0):\(self.ipcPort ?? 0)" } ?? "none", privacy: .public)")
+        // 回执：当前生效的匹配集（Host CLI 验证用）。
+        let ack: [String: Any] = [
+            "ok": true,
+            "match": modeDesc,
+            "includePids": filter.includePids.map { Int($0) },
+            "includePaths": filter.includePaths,
+        ]
+        completion((try? JSONSerialization.data(withJSONObject: ack)) ?? Data("{}".utf8))
     }
 
     override func stopProxy(with reason: NEProviderStopReason) async {
