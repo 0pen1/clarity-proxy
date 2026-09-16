@@ -29,8 +29,6 @@ brew install --cask netproxy
 
 Releases are notarized (Developer ID + staple) — no Xcode or developer-account registration needed on the target machine.
 
-## Quick start
-
 ## Quick start (from source)
 
 ```bash
