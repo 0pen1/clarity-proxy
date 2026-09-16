@@ -358,7 +358,7 @@ enum ProxyCtl {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
         proc.arguments = ["show", "--last", "1m", "--info", "--debug",
-                          "--predicate", "subsystem == \"local.clarity\" AND category == \"extension\"",
+                          "--predicate", "category == \"extension\" AND (subsystem == \"local.clarity\" OR subsystem == \"local.netproxy\")",
                           "--style", "compact"]
         let pipe = Pipe()
         proc.standardOutput = pipe
