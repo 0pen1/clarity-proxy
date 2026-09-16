@@ -19,7 +19,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>3.1</string>
 	<key>CFBundleVersion</key>
-	<string>21</string>
+	<string>24</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSAppTransportSecurity</key>
@@ -36,7 +36,7 @@
 		<key>NEProviderClasses</key>
 		<dict>
 			<key>com.apple.networkextension.app-proxy</key>
-			<string>${MODULE_NAME}.Provider</string>
+			<string>local_netproxy_3w73w8c23l_extension.Provider</string>
 		</dict>
 	</dict>
 </dict>

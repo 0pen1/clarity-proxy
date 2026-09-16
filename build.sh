@@ -26,7 +26,6 @@ if [ -n "${DEVELOPMENT_TEAM:-}" ]; then
   /usr/bin/sed -i.bak \
     -e 's/${DEVELOPMENT_TEAM}/'"${DEVELOPMENT_TEAM}"'/' \
     -e 's/${DEVELOPMENT_TEAM_LC}/'"${TEAM_LC}"'/g' project.yml && rm -f project.yml.bak
-  /usr/bin/sed -i.bak 's/${MODULE_NAME}/local_clarity_'"${TEAM_LC}"'_extension/' netproxy/ext-Info.plist && rm -f netproxy/ext-Info.plist.bak
   echo "DEVELOPMENT_TEAM=${DEVELOPMENT_TEAM} (bundle: local.clarity.${TEAM_LC}) written"
 fi
 
