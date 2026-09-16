@@ -149,6 +149,54 @@ struct ProxyStatus {
     var treeMode: Bool
 }
 
+// MARK: - 进程枚举（ProcessPicker 数据源）
+
+struct ProcessInfoRow: Identifiable {
+    var id: Int { pid }
+    let pid: Int
+    let name: String        // 进程名（basename）
+    let path: String        // proc_pidpath 全路径（root 进程拿不到为空）
+}
+
+enum ProcessList {
+    /// sysctl(KERN_PROC_ALL) 两段式调用 + proc_pidpath。跳过自身与 kernel。
+    /// 已知边界:非同 uid 进程 proc_pidpath 拿不到路径(显示进程名+pid,路径列空)。
+    static func enumerate() -> [ProcessInfoRow] {
+        var size: Int = 0
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+        // 第一段:只探大小
+        if sysctl(&mib, 3, nil, &size, nil, 0) != 0 || size == 0 { return [] }
+        var count = size / MemoryLayout<kinfo_proc>.stride
+        var infos = Array(repeating: kinfo_proc(), count: count)
+        var realSize = size
+        // 第二段:真实读取(进程表可能增长,读失败重试一次)
+        if sysctl(&mib, 3, &infos, &realSize, nil, 0) != 0 {
+            count = realSize / MemoryLayout<kinfo_proc>.stride
+            infos = Array(repeating: kinfo_proc(), count: count)
+            if sysctl(&mib, 3, &infos, &realSize, nil, 0) != 0 { return [] }
+        }
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        var rows: [ProcessInfoRow] = []
+        rows.reserveCapacity(realSize / MemoryLayout<kinfo_proc>.stride)
+        for i in 0..<(realSize / MemoryLayout<kinfo_proc>.stride) {
+            let pid = Int(infos[i].kp_proc.p_pid)
+            if pid <= 1 || pid == selfPid { continue }
+            var name = withUnsafeBytes(of: infos[i].kp_proc.p_comm) { raw in
+                String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+            }
+            var path = ""
+            var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+            if proc_pidpath(Int32(pid), &buf, UInt32(MAXPATHLEN)) > 0 {
+                let p = String(cString: buf)
+                path = p
+                name = (p as NSString).lastPathComponent
+            }
+            rows.append(ProcessInfoRow(pid: pid, name: name, path: path))
+        }
+        return rows.sorted { $0.pid < $1.pid }
+    }
+}
+
 // MARK: - 代理配置启停
 
 enum ProxyCtl {
@@ -642,6 +690,7 @@ final class AppState: ObservableObject {
     @Published var toast: String? = nil
     @Published var lastActionText = "—"
     @Published var statusDetail: ProxyStatus? = nil
+    @Published var pickerRequested = false
 
     var onIconChange: ((String) -> Void)? = nil
 
@@ -649,6 +698,11 @@ final class AppState: ObservableObject {
 
     init() {
         refreshNow()
+    }
+
+    /// 监控区"添加监控"按钮 → RootView 监听 pickerRequested 弹 sheet。
+    func showPicker() {
+        pickerRequested = true
     }
 
     func refreshNow() {
@@ -710,7 +764,7 @@ final class AppState: ObservableObject {
             } catch {
                 toast = "启动失败: \(error.localizedDescription)"
             }
-    }
+        }
     }
 
     func doStop() {
@@ -724,6 +778,38 @@ final class AppState: ObservableObject {
                 }
             } catch {
                 toast = "停止失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// 加监控 pid：merge 进现有集合。未启动时自动 start（enable:true 覆盖两种状态）。
+    func doAddPids(_ pids: [Int]) {
+        guard !busy, !pids.isEmpty else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.apply(patch: ProxyPatch(addPids: pids), enable: true) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "添加监控失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// 删监控 pid（merge 语义的 --remove-pid）。
+    func doRemovePid(_ pid: Int) {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.apply(patch: ProxyPatch(removePids: [pid]), enable: true) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "移除监控失败: \(error.localizedDescription)"
             }
         }
     }
@@ -752,7 +838,7 @@ final class AppState: ObservableObject {
 
 // MARK: - GUI 视图
 
-/// Popover 根视图：状态头 + 主按钮 + 摘要（Step 2 壳，后续步扩展）。
+/// Popover 根视图：状态头 + 主按钮 + 摘要 + 监控列表（Step 3）。
 struct RootView: View {
     @ObservedObject var state: AppState
 
@@ -768,7 +854,7 @@ struct RootView: View {
                     .font(.caption).foregroundColor(.secondary)
             }
             if let d = state.statusDetail {
-                VStack(alignment: .leading,  spacing: 4) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("出口: \(d.upstreamMode)://\(d.upstreamHost):\(d.upstreamPort)")
                     Text("IPC: \(d.ipcDesc)")
                     Text("匹配: \(d.matchDesc)")
@@ -778,6 +864,8 @@ struct RootView: View {
             } else {
                 Text("扩展未配置——见下方说明").font(.caption).foregroundColor(.secondary)
             }
+            Divider()
+            MonitorSection(state: state)
             Divider()
             HStack {
                 Button(action: { state.doStart() }) {
@@ -803,7 +891,126 @@ struct RootView: View {
             Spacer()
         }
         .padding(14)
-        .frame(width: 380, height: 320)
+        .frame(width: 380, height: 480)
+        .sheet(isPresented: $state.pickerRequested) {
+            ProcessPicker(state: state, onClose: { state.pickerRequested = false })
+        }
+    }
+}
+
+// MARK: - 监控区
+
+/// 监控列表：pid 行（进程名 + 删除按钮）+ [+ 添加监控] 按钮。
+struct MonitorSection: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("监控").font(.subheadline).fontWeight(.semibold)
+                Spacer()
+                Button(action: { state.showPicker() }) {
+                    Label("添加监控…", systemImage: "plus")
+                }
+                .buttonStyle(.link)
+                .disabled(state.busy)
+                .help("从运行中的进程选择要监控的 pid（进程树语义，含未来子进程）")
+            }
+            let pids = state.statusDetail?.pids ?? []
+            if pids.isEmpty {
+                Text("未配置监控规则").font(.caption).foregroundColor(.secondary)
+            } else {
+                ForEach(pids, id: \.self) { pid in
+                    HStack {
+                        Image(systemName: "scope")
+                            .foregroundColor(.accentColor)
+                            .font(.caption)
+                        Text("pid \(pid)")
+                            .font(.system(size: 11, design: .monospaced))
+                        Spacer()
+                        Button(action: { state.doRemovePid(pid) }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(state.busy)
+                        .help("停止监控该 pid（热更秒生效）")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 进程选择器
+
+/// 从运行中的进程选择要监控的 pid：搜索（名称/pid）+ 点行即添加。
+/// root 进程 proc_pidpath 拿不到路径——显示进程名+pid，路径列空。
+struct ProcessPicker: View {
+    @ObservedObject var state: AppState
+    var onClose: () -> Void = {}
+    @State private var searchText = ""
+    @State private var processes: [ProcessInfoRow] = []
+    @State private var loaded = false
+
+    var filtered: [ProcessInfoRow] {
+        let q = searchText.lowercased()
+        guard !q.isEmpty else { return processes }
+        return processes.filter {
+            $0.name.lowercased().contains(q) || String($0.pid).contains(q)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("选择进程").font(.headline)
+                Spacer()
+                Button("完成") { onClose() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            TextField("搜索名称或 pid…", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+            if loaded {
+                List(filtered) { p in
+                    Button(action: {
+                        state.doAddPids([p.pid])
+                        onClose()
+                    }) {
+                        HStack {
+                            Text(p.name).font(.system(size: 12, weight: .medium))
+                            Spacer()
+                            Text(p.path.isEmpty ? "" : p.path)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                            Text(String(p.pid))
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("枚举进程…").font(.caption).foregroundColor(.secondary)
+                }
+                Spacer()
+            }
+            Text("监控以进程树生效：连接发起时实时回溯祖先链，子进程动态覆盖。root 进程不显示路径，可直接输 pid 搜索。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+        .padding(14)
+        .frame(width: 380, height: 420)
+        .task {
+            // 后台枚举（~几百进程），完成回主线程
+            let rows = ProcessList.enumerate()
+            processes = rows
+            loaded = true
+        }
     }
 }
 

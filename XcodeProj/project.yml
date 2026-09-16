@@ -2,7 +2,7 @@ name: netproxy
 options:
   bundleIdPrefix: local.netproxy
   deploymentTarget:
-    macOS: "11.0"
+    macOS: "12.0"
   createIntermediateGroups: true
   xcodeVersion: "15.4"
 settings:
