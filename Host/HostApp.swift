@@ -135,7 +135,7 @@ enum ApplyEvent {
 }
 
 /// status 的结构化视图（GUI 状态头与 CLI status 共用）。
-struct ProxyStatus {
+struct ProxyStatus: Equatable {
     var enabled: Bool
     var statusRaw: Int
     var upstreamMode: String
@@ -814,6 +814,74 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 改出口：三项给全才替换（与 CLI "给一项就整组替换"语义一致——GUI 要求全项，
+    /// 避免半改状态）。未启动时自动 start。校验在 UpstreamSection 内做，这里兜底。
+    func doApplyUpstream(mode: String, host: String, port: Int) {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                var patch = ProxyPatch()
+                patch.upstreamMode = mode
+                if mode == "socks5" {
+                    patch.upstreamHost = host
+                    patch.upstreamPort = port
+                }
+                try await ProxyCtl.apply(patch: patch, enable: true) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "出口变更失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: ⚙ 菜单动作
+
+    func doActivate() {
+        guard !busy else { return }
+        busy = true
+        toast = "激活中——如弹系统设置请在隐私与安全性里批准"
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await SysexInstaller.shared.activate()
+                toast = "系统扩展 active"
+            } catch {
+                toast = "激活失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func doDeactivate() {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await SysexInstaller.shared.deactivate()
+                toast = "系统扩展已停用"
+            } catch {
+                toast = "停用失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func doUninstall() {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.uninstallConfig()
+                toast = "配置已卸载"
+            } catch {
+                toast = "卸载失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func handleEvent(_ event: ApplyEvent) {
         switch event {
         case .hotReloaded(let match, _, _, _):
@@ -841,6 +909,7 @@ final class AppState: ObservableObject {
 /// Popover 根视图：状态头 + 主按钮 + 摘要 + 监控列表（Step 3）。
 struct RootView: View {
     @ObservedObject var state: AppState
+    @State private var showUninstallConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -850,20 +919,40 @@ struct RootView: View {
                     .frame(width: 10, height: 10)
                 Text(state.statusText).font(.headline)
                 Spacer()
+                // ⚙ 菜单：激活/停用扩展、卸载配置（确认）、复制诊断命令
+                Menu {
+                    Button("激活系统扩展…") { state.doActivate() }
+                    Button("停用系统扩展") { state.doDeactivate() }
+                    Divider()
+                    Button("复制诊断命令", systemImage: "doc.on.doc") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(
+                            "/Applications/NetProxy.app/Contents/MacOS/NetProxy status\n/usr/bin/log show --last 10m --info --debug --predicate 'subsystem == \"local.clarity\" OR subsystem == \"local.netproxy\"'",
+                            forType: .string)
+                    }
+                    Divider()
+                    Button("卸载配置…", role: .destructive) { showUninstallConfirm = true }
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
                 Text("NetProxy v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
                     .font(.caption).foregroundColor(.secondary)
             }
             if let d = state.statusDetail {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("出口: \(d.upstreamMode)://\(d.upstreamHost):\(d.upstreamPort)")
                     Text("IPC: \(d.ipcDesc)")
                     Text("匹配: \(d.matchDesc)")
                 }
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
             } else {
-                Text("扩展未配置——见下方说明").font(.caption).foregroundColor(.secondary)
+                Text("扩展未激活——⚙ 菜单 →「激活系统扩展」，批准后回来自动刷新")
+                    .font(.caption).foregroundColor(.secondary)
             }
+            Divider()
+            UpstreamSection(state: state)
             Divider()
             MonitorSection(state: state)
             Divider()
@@ -879,6 +968,13 @@ struct RootView: View {
                 .disabled(!(state.statusDetail?.enabled ?? false) || state.busy)
                 .help("停止透明代理（配置保留）")
             }
+            // 空规则警示条：enabled 且无任何规则 = 拦所有非系统进程流量，不静默
+            if state.enabled, let d = state.statusDetail,
+               d.pids.isEmpty, d.include.isEmpty {
+                Label("未配置任何监控规则——当前将拦截所有非系统进程流量", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
             if state.busy {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -891,10 +987,98 @@ struct RootView: View {
             Spacer()
         }
         .padding(14)
-        .frame(width: 380, height: 480)
+        .frame(width: 380, height: 560)
         .sheet(isPresented: $state.pickerRequested) {
             ProcessPicker(state: state, onClose: { state.pickerRequested = false })
         }
+        .confirmationDialog("卸载代理配置？", isPresented: $showUninstallConfirm, titleVisibility: .visible) {
+            Button("卸载配置", role: .destructive) { state.doUninstall() }
+        } message: {
+            Text("将删除 NetProxy 的隧道配置（系统扩展仍保留）。遇状态机异常时使用。")
+        }
+    }
+}
+
+// MARK: - 出口表单
+
+/// 出口三态：direct / socks5 / gk。socks5 显示 host:port 输入（值有变化才可应用）。
+/// gk 需要已配置的 ipc（沿用现有——GUI 不提供 ipc 编辑，避免误配）。
+struct UpstreamSection: View {
+    @ObservedObject var state: AppState
+    @State private var mode = ""
+    @State private var host = ""
+    @State private var portText = ""
+
+    /// 当前生效值（从 statusDetail 同步——首次加载与外部变更后）
+    private func syncFromStatus() {
+        guard let d = state.statusDetail, mode.isEmpty else { return }
+        mode = d.upstreamMode
+        if d.upstreamMode == "socks5" {
+            host = d.upstreamHost
+            portText = String(d.upstreamPort)
+        }
+    }
+
+    private var dirty: Bool {
+        guard let d = state.statusDetail else { return false }
+        if mode != d.upstreamMode { return true }
+        if mode == "socks5" {
+            return host != d.upstreamHost || Int(portText) != d.upstreamPort
+        }
+        return false
+    }
+
+    private var invalid: String? {
+        if mode == "socks5" {
+            if host.isEmpty { return "SOCKS5 需要主机地址" }
+            if let p = Int(portText), p > 0, p < 65536 { return nil }
+            return "端口需为 1-65535"
+        }
+        if mode == "gk", state.statusDetail?.ipcDesc == "none" {
+            return "网关模式需要 IPC——请先用 CLI 配置一次 --ipc-tcp"
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("出口").font(.subheadline).fontWeight(.semibold)
+                Spacer()
+                Picker("", selection: $mode) {
+                    Text("直连").tag("direct")
+                    Text("SOCKS5").tag("socks5")
+                    Text("网关").tag("gk")
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+                .disabled(state.busy)
+            }
+            if mode == "socks5" {
+                HStack(spacing: 6) {
+                    TextField("主机", text: $host)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                    TextField("端口", text: $portText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 60)
+                        .font(.system(size: 11, design: .monospaced))
+                }
+            }
+            HStack {
+                if let err = invalid {
+                    Text(err).font(.caption2).foregroundColor(.orange)
+                }
+                Spacer()
+                Button("应用") {
+                    state.doApplyUpstream(mode: mode, host: host, port: Int(portText) ?? 0)
+                }
+                .disabled(!dirty || invalid != nil || state.busy)
+                .help("变更出口并启动/保持代理运行（未连接时自动 start）")
+            }
+        }
+        .onAppear { syncFromStatus() }
+        .onChange(of: state.statusDetail) { _ in syncFromStatus() }
     }
 }
 
@@ -1028,8 +1212,9 @@ struct HostApp {
         var cmd = allArgs.first ?? "help"
         // apply 的参数 = 去掉命令词后的剩余项
         let args = Array(allArgs.dropFirst())
-        // Xcode Run 调试时自动激活。系统扩展要求 app 位于 /Applications:
-        // 若从 DerivedData 运行,先自我部署到 /Applications 再由那个副本执行
+        // Xcode Run 调试时自动部署。系统扩展要求 app 位于 /Applications:
+        // 若从 DerivedData 运行,先自我部署到 /Applications,再 open 拉起 GUI 副本
+        // (Xcode 调试主形态=GUI;扩展激活走面板 ⚙ 菜单)
         if ProcessInfo.processInfo.environment["__XCODE_BUILT_PRODUCTS_DIR_PATHS"] != nil
             && cmd == "help"
             && !Bundle.main.bundlePath.hasPrefix("/Applications") {
@@ -1042,18 +1227,12 @@ struct HostApp {
             } catch {
                 print("[xcode-debug] deploy failed: \(error) — 请手动复制到 /Applications")
             }
-            print("[xcode-debug] deployed. 请在 /Applications/NetProxy.app 运行 activate,或再次 Cmd+R 前先手动同步。")
-            // 直接 exec 部署后的副本执行 activate
+            // open 拉起部署后的 GUI 副本（无参启动 → 菜单栏模式）
             let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "\(dst)/Contents/MacOS/NetProxy")
-            proc.arguments = ["activate"]
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            proc.arguments = [dst]
             try? proc.run()
-            proc.waitUntilExit()
-            exit(Int32(proc.terminationStatus))
-        }
-        if ProcessInfo.processInfo.environment["__XCODE_BUILT_PRODUCTS_DIR_PATHS"] != nil && cmd == "help" {
-            cmd = "activate"
-            print("[xcode-debug] auto-activating system extension...")
+            exit(0)
         }
         do {
             switch cmd {

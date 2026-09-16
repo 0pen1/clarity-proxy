@@ -48,6 +48,17 @@ cp -R XcodeProj/build/Build/Products/Debug/NetProxy.app /Applications/ && xattr 
   --predicate 'subsystem == "local.netproxy" AND category == "extension"'
 ```
 
+## 菜单栏 GUI（v3.3+）
+
+双击 `/Applications/NetProxy.app`（或 `open`）即启动菜单栏应用——无参数启动进 GUI，带参数启动仍是 CLI，两者共用同一控制面：
+
+- **状态灯**：绿=已连接，红=未激活/未配置，橙=连接中
+- **监控区**：点「+ 添加监控…」从运行中的进程列表选 pid（搜索支持名称/pid，root 进程只显示进程名）。点行即添加，删除按钮即时生效（热更通道，不重启代理）
+- **出口**：直连 / SOCKS5 / 网关三档切换，SOCKS5 填 host:port 后点「应用」
+- **⚙ 菜单**：激活/停用系统扩展（首次激活弹系统设置批准）、卸载配置（确认对话框）、复制诊断命令
+
+> 已知边界：root 进程 `proc_pidpath` 拿不到路径，进程选择器只显示进程名 + pid（可搜索 pid 添加）。
+
 ## 上游模式
 
 ```bash
