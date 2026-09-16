@@ -11,6 +11,7 @@ private let hostLog = Logger(subsystem: "local.clarity", category: "host")
 final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @unchecked Sendable {
     static let shared = SysexInstaller()
     var continuation: CheckedContinuation<Void, Error>?
+    var propsContinuation: CheckedContinuation<[String], Never>?
 
     func activate() async throws {
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
@@ -34,10 +35,11 @@ final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @uncheck
         }
     }
 
-    func discover() async throws {
+    /// discover 的结构化版：返回逐行文本（空 = 系统未扫描到扩展时也返回单行提示）。
+    func discover() async -> [String] {
         if #available(macOS 12.0, *) {
-            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-                self.continuation = c
+            return await withCheckedContinuation { (c: CheckedContinuation<[String], Never>) in
+                self.propsContinuation = c
                 let req = OSSystemExtensionRequest.propertiesRequest(
                     forExtensionWithIdentifier: ProxyCtl.extensionBundleID,
                     queue: .main)
@@ -45,7 +47,7 @@ final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @uncheck
                 OSSystemExtensionManager.shared.submitRequest(req)
             }
         } else {
-            print("propertiesRequest requires macOS 12+")
+            return ["propertiesRequest requires macOS 12+"]
         }
     }
 
@@ -65,6 +67,8 @@ final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @uncheck
         hostLog.error("sysex request failed: \(error.localizedDescription, privacy: .public)")
         continuation?.resume(throwing: error)
         continuation = nil
+        propsContinuation?.resume(returning: [])
+        propsContinuation = nil
     }
 
     func request(_ request: OSSystemExtensionRequest,
@@ -72,22 +76,75 @@ final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @uncheck
         hostLog.info("sysex activate finished: \(result.rawValue)")
         continuation?.resume()
         continuation = nil
+        propsContinuation?.resume(returning: [])
+        propsContinuation = nil
     }
 
     func request(_ request: OSSystemExtensionRequest,
                  foundProperties properties: [OSSystemExtensionProperties]) {
+        var lines: [String]
         if properties.isEmpty {
-            print("NO PROPERTIES FOUND (系统没有扫描到该 identifier 的扩展)")
+            lines = ["NO PROPERTIES FOUND (系统没有扫描到该 identifier 的扩展)"]
         } else {
-            for p in properties {
+            lines = properties.map { p in
                 let enabled = p.responds(to: Selector(("isEnabled"))) ? (p.value(forKey: "isEnabled") as? Bool ?? false) : false
                 let awaiting = p.responds(to: Selector(("isAwaitingUserApproval"))) ? (p.value(forKey: "isAwaitingUserApproval") as? Bool ?? false) : false
-                print("found: \(p.bundleIdentifier) v\(p.bundleVersion) enabled=\(enabled) awaiting=\(awaiting) url=\(p.url.path)")
+                return "found: \(p.bundleIdentifier) v\(p.bundleVersion) enabled=\(enabled) awaiting=\(awaiting) url=\(p.url.path)"
             }
         }
-        continuation?.resume()
-        continuation = nil
+        propsContinuation?.resume(returning: lines)
+        propsContinuation = nil
     }
+}
+
+// MARK: - 类型化配置（CLI 与 GUI 共用）
+
+/// 一次配置变更的增量描述，与 CLI 参数语义一一对应：
+/// 默认 MERGE 到现有规则（pid/路径集合增删）；--fresh 整体重建；
+/// 连接参数（upstream/ipc）给一项就整组替换，未给沿用现有值。
+struct ProxyPatch {
+    var addInclude: [String] = []
+    var removeInclude: [String] = []
+    var addPids: [Int] = []
+    var removePids: [Int] = []
+    var addExclude: [String] = []
+    var treeMode: Bool? = nil
+    var upstreamMode: String? = nil
+    var upstreamHost: String? = nil
+    var upstreamPort: Int? = nil
+    var ipcPath: String? = nil
+    var ipcHost: String? = nil
+    var ipcPort: Int? = nil
+    var fresh = false
+}
+
+/// apply 过程中的关键事件（回调顺序即发生顺序）。
+/// CLI 据此打印既有文案，GUI 据此驱动 toast/alert——两层共用同一事件流。
+enum ApplyEvent {
+    case badConfig(String)                 // 配置非法，中止（CLI exit 2）
+    case missingPid(Int)                   // pid 不存在，警告
+    case hotReloaded(match: String, pids: [Int], include: [String], tree: Bool)
+    case hotReloadFallback                 // sendMessage 未获回执，落回重启隧道路径
+    case staleProvider(pid: Int32, etime: String)  // 扩展进程早于本次 start，NESM 将复用
+    case waitTimeout                       // 15s 内未 connected（僵尸 provider 特征）
+    case startProxyMissing                 // connected 但 startProxy 未执行（僵尸特征）
+    case started(pids: [Int], include: [String], tree: Bool, argInclude: [String])
+    case stopped
+}
+
+/// status 的结构化视图（GUI 状态头与 CLI status 共用）。
+struct ProxyStatus {
+    var enabled: Bool
+    var statusRaw: Int
+    var upstreamMode: String
+    var upstreamHost: String
+    var upstreamPort: Int
+    var ipcDesc: String
+    var matchDesc: String
+    var include: [String]
+    var exclude: [String]
+    var pids: [Int]
+    var treeMode: Bool
 }
 
 // MARK: - 代理配置启停
@@ -97,82 +154,108 @@ enum ProxyCtl {
     /// PRODUCT_BUNDLE_IDENTIFIER 决定，fork 用户改 project.yml 即整体换标识）。
     static let extensionBundleID = (Bundle.main.bundleIdentifier ?? "local.clarity") + ".extension"
 
-    /// 解析 --include/--include-tree/--exclude/--include-pid/--remove-pid/
-    /// --upstream/--ipc/--ipc-tcp 参数并应用。
-    /// 合并语义：start 默认 MERGE 到现有规则上（--include-pid A 之后 --include-pid B
-    /// = 同时监控两个 pid）——NETransparentProxyManager 是全局单配置，第二次 start
-    /// 若整体替换会丢掉第一次的规则。--fresh 显式回到"整体替换"。
-    /// 运行连接参数（upstream/ipc）以本次命令行为准：给了一项就整体替换这一组，
-    /// 一项都没给则沿用现有值。
+    /// CLI 入口：解析参数 → ProxyPatch → 核心 apply，事件打印为既有文案
+    /// （文案已被 gatekeeper 侧文档/排障协议引用，保持逐字兼容）。
     static func apply(args: [String], enable: Bool) async throws {
-        var include: [String] = []
-        var exclude: [String] = []
-        var treeMode: Bool? = nil
-        var includePids: [Int] = []
-        var removePids: [Int] = []
-        var removeInclude: [String] = []
-        var fresh = false
-        var upstreamMode: String? = nil
-        var upstreamHost: String? = nil
-        var upstreamPort: Int? = nil
-        var ipcPath: String? = nil
-        var ipcHost: String? = nil
-        var ipcPort: Int? = nil
+        let patch = parseArgs(args)
+        try await apply(patch: patch, enable: enable) { event in
+            switch event {
+            case .badConfig(let msg):
+                fputs("\(msg)\n", stderr)
+                exit(2)
+            case .missingPid(let p):
+                fputs("警告: pid \(p) 不存在(已退出?)——pid 匹配将不会命中任何流量\n", stderr)
+            case .hotReloaded(let match, let pids, let include, let tree):
+                print("✓ hot-reloaded (match: \(match)) — provider 未重启，规则即时生效")
+                print("  (pids=\(pids) include=\(include) tree=\(tree))")
+            case .hotReloadFallback:
+                print("⚠️  sendMessage 热更未获回执——回退到重启隧道路径")
+            case .staleProvider(let pid, let etime):
+                print("⚠️  检测到运行中的扩展进程（pid \(pid)，已存活 \(etime)）——")
+                print("   它早于本次 start，NESM 将复用它且不会加载新配置。")
+                print("   强烈建议先: sudo kill -9 \(pid) && sleep 2  再 start（本命令未自动执行，需要 sudo）")
+            case .waitTimeout:
+                print("⚠️  proxy started 但 15s 内未 connected——僵尸 provider 特征：")
+                print("   1) 重试: $APP stop && sleep 5 && $APP start ...")
+                print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
+                print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
+                print("   诊断: /usr/bin/log show --last 2m --info --debug --predicate 'process == \"nesessionmanager\" AND eventMessage CONTAINS \"NetProxy\"'")
+            case .startProxyMissing:
+                print("⚠️  connected 但 provider 未执行 startProxy（配置未加载）——")
+                print("   NESM 复用了旧 provider 进程。处置同上：pkill 后重试，或重启 Mac。")
+            case .started(let pids, let include, let tree, let argInclude):
+                print("proxy started (match: pids=\(pids) include=\(include) tree=\(tree))")
+                // 旧行为保留:第二行打印本次 CLI 参数的 include(非合并列表)——逐字对齐
+                print("✓ verified: connected + startProxy loaded (config: pid=\(pids) include=\(argInclude))")
+            case .stopped:
+                print("proxy stopped (config saved, disabled)")
+            }
+        }
+    }
 
+    /// 解析 CLI 参数为 ProxyPatch。与 apply 的参数语义见各 case 注释。
+    static func parseArgs(_ args: [String]) -> ProxyPatch {
+        var patch = ProxyPatch()
         var it = args.makeIterator()
         while let a = it.next() {
             switch a {
             case "--include":
-                if let v = it.next() { include.append(v) }
+                if let v = it.next() { patch.addInclude.append(v) }
             case "--include-tree":
                 // 进程树匹配:祖先链(发起进程→pid 1)任一路径命中即拦——
                 // claude 调 bash 跑 curl 的子进程流量全覆盖(树动态生长天然支持,
                 // 连接发起时实时反查,非预登记)。孤儿进程(链断)放行。
-                if let v = it.next() { include.append(v); treeMode = true }
+                if let v = it.next() { patch.addInclude.append(v); patch.treeMode = true }
             case "--include-pid":
                 // pid 树匹配:祖先链 pid 精确命中——只拦该进程及其枝干,零误伤。
                 // 用法:pgrep claude 拿 pid → --include-pid <pid>;其他 claude
                 // 实例/手动启动的同名进程不受影响。可重复,merge 进现有集合。
-                if let v = it.next(), let p = Int(v), p > 1 { includePids.append(p) }
+                if let v = it.next(), let p = Int(v), p > 1 { patch.addPids.append(p) }
             case "--remove-pid":
                 // 从现有监控集合移除该 pid(被监控进程退出后清规则)。
-                if let v = it.next(), let p = Int(v), p > 1 { removePids.append(p) }
+                if let v = it.next(), let p = Int(v), p > 1 { patch.removePids.append(p) }
             case "--remove-include":
                 // 从现有 include 路径集合移除该子串。
-                if let v = it.next() { removeInclude.append(v) }
+                if let v = it.next() { patch.removeInclude.append(v) }
             case "--exclude":
-                if let v = it.next() { exclude.append(v) }
+                if let v = it.next() { patch.addExclude.append(v) }
             case "--fresh":
                 // 忽略现有规则,从本次命令行重建(旧行为)。
-                fresh = true
+                patch.fresh = true
             case "--upstream":
                 if let v = it.next() {
                     // socks5://host:port 或 direct 或 gk
                     if v.hasPrefix("socks5://") {
-                        upstreamMode = "socks5"
+                        patch.upstreamMode = "socks5"
                         let rest = v.dropFirst("socks5://".count)
                         let parts = rest.split(separator: ":")
-                        if parts.count >= 1 { upstreamHost = String(parts[0]) }
-                        if parts.count >= 2 { upstreamPort = Int(parts[1]) ?? 1080 }
+                        if parts.count >= 1 { patch.upstreamHost = String(parts[0]) }
+                        if parts.count >= 2 { patch.upstreamPort = Int(parts[1]) ?? 1080 }
                     } else if v == "gk" {
-                        upstreamMode = "gk"
+                        patch.upstreamMode = "gk"
                     } else if v == "direct" {
-                        upstreamMode = "direct"
+                        patch.upstreamMode = "direct"
                     }
                 }
             case "--ipc":
-                if let v = it.next() { ipcPath = v }
+                if let v = it.next() { patch.ipcPath = v }
             case "--ipc-tcp":
                 if let v = it.next() {
                     let parts = v.split(separator: ":")
-                    if parts.count >= 1 { ipcHost = String(parts[0]) }
-                    if parts.count >= 2 { ipcPort = Int(parts[1]) }
+                    if parts.count >= 1 { patch.ipcHost = String(parts[0]) }
+                    if parts.count >= 2 { patch.ipcPort = Int(parts[1]) }
                 }
             default:
                 fputs("unknown arg \(a)\n", stderr)
             }
         }
+        return patch
+    }
 
+    /// 核心 apply：读取现有配置 → merge → 校验 → 保存 → 启停（含防假成功三件套
+    /// 与热更快路径）。事件通过 report 回调按发生顺序上报。
+    static func apply(patch: ProxyPatch, enable: Bool,
+                      report: @escaping (ApplyEvent) -> Void) async throws {
         // 读取现有配置（merge 基线）。
         let managers = try await NETransparentProxyManager.loadAllFromPreferences()
         let manager = managers.first { m in
@@ -182,50 +265,50 @@ enum ProxyCtl {
         let oldProto = manager.protocolConfiguration as? NETunnelProviderProtocol
         let old = oldProto?.providerConfiguration ?? [:]
 
-        // 合并规则集合：--fresh 或首次配置时以命令行为基线；否则在现有集合上增删。
+        // 合并规则集合：fresh 或首次配置时以本次 patch 为基线；否则在现有集合上增删。
         var mergedInclude: [String]
         var mergedExclude: [String]
         var mergedPids: [Int]
-        if fresh || old.isEmpty {
-            mergedInclude = include
-            mergedExclude = exclude
-            mergedPids = includePids
+        if patch.fresh || old.isEmpty {
+            mergedInclude = patch.addInclude
+            mergedExclude = patch.addExclude
+            mergedPids = patch.addPids
         } else {
             let oldInclude = (old["includeProcessPaths"] as? [String]) ?? []
             let oldExclude = (old["excludeProcessPaths"] as? [String]) ?? []
             let oldPids = ((old["includePids"] as? [NSNumber]) ?? []).map { $0.intValue }
-            mergedInclude = Array(Set(oldInclude).union(include))
-            mergedExclude = Array(Set(oldExclude).union(exclude))
-            mergedPids = Array(Set(oldPids).union(includePids))
+            mergedInclude = Array(Set(oldInclude).union(patch.addInclude))
+            mergedExclude = Array(Set(oldExclude).union(patch.addExclude))
+            mergedPids = Array(Set(oldPids).union(patch.addPids))
         }
-        for p in removePids { mergedPids.removeAll { $0 == p } }
-        for s in removeInclude { mergedInclude.removeAll { $0 == s } }
+        for p in patch.removePids { mergedPids.removeAll { $0 == p } }
+        for s in patch.removeInclude { mergedInclude.removeAll { $0 == s } }
 
         // 运行连接参数：给了一项就整体替换这一组；一项没给则沿用现有。
         let oldUpstreamMode = (old["upstreamMode"] as? String) ?? "direct"
         let oldUpstreamHost = (old["upstreamHost"] as? String) ?? "127.0.0.1"
         let oldUpstreamPort = (old["upstreamPort"] as? Int) ?? 1080
-        let effUpstreamMode = upstreamMode ?? oldUpstreamMode
-        let effUpstreamHost = upstreamHost ?? oldUpstreamHost
-        let effUpstreamPort = upstreamPort ?? oldUpstreamPort
-        let effIpcPath = ipcPath ?? (old["ipcPath"] as? String)
-        let effIpcHost = ipcHost ?? (old["ipcHost"] as? String)
-        let effIpcPort = ipcPort ?? (old["ipcPort"] as? Int)
-        // treeMode：本次给了 --include-tree 置 true；--fresh 时按命令行（无 tree 即 false）；
+        let effUpstreamMode = patch.upstreamMode ?? oldUpstreamMode
+        let effUpstreamHost = patch.upstreamHost ?? oldUpstreamHost
+        let effUpstreamPort = patch.upstreamPort ?? oldUpstreamPort
+        let effIpcPath = patch.ipcPath ?? (old["ipcPath"] as? String)
+        let effIpcHost = patch.ipcHost ?? (old["ipcHost"] as? String)
+        let effIpcPort = patch.ipcPort ?? (old["ipcPort"] as? Int)
+        // treeMode：本次给了 --include-tree 置 true；--fresh 时按本次（无 tree 即 false）；
         // 否则沿用现有 true（一旦开过树匹配,merge 场景保持,避免第二次 start 静默关闭）。
         let oldTreeMode = (old["treeMode"] as? Bool) ?? false
-        let effTreeMode = treeMode ?? (fresh ? false : oldTreeMode)
+        let effTreeMode = patch.treeMode ?? (patch.fresh ? false : oldTreeMode)
 
         if effUpstreamMode == "gk" && effIpcPath == nil && effIpcHost == nil {
-            fputs("--upstream gk 需要 --ipc <socket-path> 或 --ipc-tcp 127.0.0.1:<port>\n", stderr)
-            exit(2)
+            report(.badConfig("--upstream gk 需要 --ipc <socket-path> 或 --ipc-tcp 127.0.0.1:<port>"))
+            return
         }
         for p in mergedPids {
             var kp = kinfo_proc()
             var size = MemoryLayout<kinfo_proc>.size
             var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(p)]
             if sysctl(&mib, 4, &kp, &size, nil, 0) != 0 || size == 0 {
-                fputs("警告: pid \(p) 不存在(已退出?)——pid 匹配将不会命中任何流量\n", stderr)
+                report(.missingPid(p))
             }
         }
 
@@ -278,27 +361,24 @@ enum ProxyCtl {
                        let ackObj = try? JSONSerialization.jsonObject(with: ack, options: []),
                        let ackDict = ackObj as? [String: Any],
                        ackDict["ok"] as? Bool == true {
-                        print("✓ hot-reloaded (match: \(ackDict["match"] ?? "?")) — provider 未重启，规则即时生效")
-                        print("  (pids=\(mergedPids) include=\(mergedInclude) tree=\(effTreeMode))")
+                        let matchDesc = "\(ackDict["match"] ?? "?")"
+                        report(.hotReloaded(match: matchDesc, pids: mergedPids,
+                                            include: mergedInclude, tree: effTreeMode))
                         return
                     }
                     // sendMessage 失败（provider 进程死/旧版本不识别消息）——落回冷启路径。
-                    print("⚠️  sendMessage 热更未获回执——回退到重启隧道路径")
+                    report(.hotReloadFallback)
                 }
             }
 
-            await ProxyCtl.checkStaleProvider()
+            await ProxyCtl.checkStaleProvider(report: report)
 
             try manager.connection.startVPNTunnel()
 
             // 2. 等 connected（startVPNTunnel 只是请求，隧道真正起来需要时间）。
             let connected = await ProxyCtl.waitConnected(timeout: 15)
             guard connected else {
-                print("⚠️  proxy started 但 15s 内未 connected——僵尸 provider 特征：")
-                print("   1) 重试: $APP stop && sleep 5 && $APP start ...")
-                print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
-                print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
-                print("   诊断: /usr/bin/log show --last 2m --info --debug --predicate 'process == \"nesessionmanager\" AND eventMessage CONTAINS \"NetProxy\"'")
+                report(.waitTimeout)
                 return
             }
 
@@ -307,20 +387,19 @@ enum ProxyCtl {
             //    这里用 subprocess 直接查 log store）。
             let startingOK = await ProxyCtl.verifyStartProxyLogged()
             if !startingOK {
-                print("⚠️  connected 但 provider 未执行 startProxy（配置未加载）——")
-                print("   NESM 复用了旧 provider 进程。处置同上：pkill 后重试，或重启 Mac。")
+                report(.startProxyMissing)
                 return
             }
-            print("proxy started (match: pids=\(mergedPids) include=\(mergedInclude) tree=\(effTreeMode))")
-            print("✓ verified: connected + startProxy loaded (config: pid=\(mergedPids) include=\(mergedInclude))")
+            report(.started(pids: mergedPids, include: mergedInclude, tree: effTreeMode,
+                            argInclude: patch.addInclude))
         } else {
-            print("proxy stopped (config saved, disabled)")
+            report(.stopped)
         }
     }
 
     /// 扩展进程年龄检查：进程启动时间早于 90 秒前 = 它不属于本次 start，
     /// NESM 将复用它（新配置不会加载）。只警告不自动杀（需要 sudo）。
-    static func checkStaleProvider() async {
+    static func checkStaleProvider(report: @escaping (ApplyEvent) -> Void) async {
         // pgrep 找扩展进程
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -360,9 +439,7 @@ enum ProxyCtl {
         // etime 形如 "1-02:03:04"（天:时:分:秒）或 "02:03"（分:秒）
         let secs = etime.split(separator: "-").flatMap { $0.split(separator: ":").compactMap { Int($0) } }.reduce(0) { $0 * 60 + $1 }
         if secs > 90 {
-            print("⚠️  检测到运行中的扩展进程（pid \(pid)，已存活 \(etime)）——")
-            print("   它早于本次 start，NESM 将复用它且不会加载新配置。")
-            print("   强烈建议先: sudo kill -9 \(pid) && sleep 2  再 start（本命令未自动执行，需要 sudo）")
+            report(.staleProvider(pid: pid, etime: etime))
         }
     }
 
@@ -371,8 +448,8 @@ enum ProxyCtl {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             let managers = (try? await NETransparentProxyManager.loadAllFromPreferences()) ?? []
-            if let m = managers.first(where: {
-                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+            if let m = managers.first(where: { m2 in
+                (m2.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                     == ProxyCtl.extensionBundleID
             }), m.connection.status == .connected {
                 return true
@@ -409,33 +486,57 @@ enum ProxyCtl {
         print("configuration removed")
     }
 
-    static func status() async throws {
+    /// status 的结构化版：未配置返回 nil。
+    static func readStatus() async throws -> ProxyStatus? {
         let managers = try await NETransparentProxyManager.loadAllFromPreferences()
-        guard let m = managers.first(where: {
-            ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+        guard let m = managers.first(where: { m2 in
+            (m2.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                 == ProxyCtl.extensionBundleID
         }) else {
-            print("no configuration")
-            return
+            return nil
         }
         let proto = m.protocolConfiguration as? NETunnelProviderProtocol
         let conf = proto?.providerConfiguration ?? [:]
-        let ipcDesc = conf["ipcPath"] as? String
+        let ipcDesc = (conf["ipcPath"] as? String)
             ?? ((conf["ipcHost"] as? String).map { "\($0):\(conf["ipcPort"] ?? 0)" })
             ?? "none"
-        let treeDesc: String
-        if let pids = conf["includePids"] as? [NSNumber], !pids.isEmpty {
-            treeDesc = "pid:" + pids.map { $0.stringValue }.joined(separator: ",")
-        } else if (conf["treeMode"] as? Bool == true) { treeDesc = "tree" }
-        else { treeDesc = "flat" }
+        let pids = ((conf["includePids"] as? [NSNumber]) ?? []).map { $0.intValue }
+        let treeMode = (conf["treeMode"] as? Bool) ?? false
+        let matchDesc: String
+        if !pids.isEmpty {
+            matchDesc = "pid:" + pids.map { String($0) }.joined(separator: ",")
+        } else if treeMode { matchDesc = "tree" }
+        else { matchDesc = "flat" }
+        return ProxyStatus(
+            enabled: m.isEnabled,
+            statusRaw: m.connection.status.rawValue,
+            upstreamMode: (conf["upstreamMode"] as? String) ?? "?",
+            upstreamHost: (conf["upstreamHost"] as? String) ?? "?",
+            upstreamPort: (conf["upstreamPort"] as? Int) ?? 0,
+            ipcDesc: ipcDesc,
+            matchDesc: matchDesc,
+            include: (conf["includeProcessPaths"] as? [String]) ?? [],
+            exclude: (conf["excludeProcessPaths"] as? [String]) ?? [],
+            pids: pids,
+            treeMode: treeMode)
+    }
+
+    static func status() async throws {
+        guard let s = try await readStatus() else {
+            print("no configuration")
+            return
+        }
+        // include/exclude 保持 plist 数组风格多行 "( )" 打印（NSArray description）——与旧版逐字一致
+        let rawInclude = NSArray(array: s.include)
+        let rawExclude = NSArray(array: s.exclude)
         print("""
-        enabled: \(m.isEnabled)
-        status: \(m.connection.status.rawValue)
-        upstream: \(conf["upstreamMode"] ?? "?")://\(conf["upstreamHost"] ?? "?"):\(conf["upstreamPort"] ?? 0)
-        ipc: \(ipcDesc)
-        match: \(treeDesc)
-        include: \(conf["includeProcessPaths"] ?? [])
-        exclude: \(conf["excludeProcessPaths"] ?? [])
+        enabled: \(s.enabled)
+        status: \(s.statusRaw)
+        upstream: \(s.upstreamMode)://\(s.upstreamHost):\(s.upstreamPort)
+        ipc: \(s.ipcDesc)
+        match: \(s.matchDesc)
+        include: \(rawInclude)
+        exclude: \(rawExclude)
         """)
     }
 }
@@ -489,7 +590,9 @@ struct HostApp {
             case "uninstall":
                 try await ProxyCtl.uninstallConfig()
             case "discover":
-                try await SysexInstaller.shared.discover()
+                for line in try await SysexInstaller.shared.discover() {
+                    print(line)
+                }
             case "start":
                 try await ProxyCtl.apply(args: args, enable: true)
             case "stop":
