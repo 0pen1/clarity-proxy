@@ -35,11 +35,14 @@ echo "=== 1. 嵌套签名（内 → 外：dylib → sysex → host）==="
 find "$APP/Contents/Frameworks" -name "*.dylib" 2>/dev/null | while read -r dylib; do
   codesign --force --sign "$CERT" --options runtime --timestamp "$dylib"
 done
-# sysex 签（devid entitlements）
+# sysex 签（devid entitlements + devid profile 背书——裸 Developer ID 签名
+# 带受限 entitlement 在非开发机上会被内核 SIGKILL（killed），必须嵌 profile）
+cp "$E/ext-devid.provisionprofile" "$SYSEX/Contents/embedded.provisionprofile"
 codesign --force --sign "$CERT" \
   --entitlements "$E/ext-devid.entitlements" \
   --options runtime --timestamp "$SYSEX"
-# host 后签（外层覆盖内层签名）
+# host 后签（同理嵌 devid profile）
+cp "$E/host-devid.provisionprofile" "$APP/Contents/embedded.provisionprofile"
 codesign --force --sign "$CERT" \
   --entitlements "$E/host-devid.entitlements" \
   --options runtime --timestamp "$APP"
