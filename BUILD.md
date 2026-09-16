@@ -62,7 +62,9 @@ targets:
   (`<module 名>.Provider`,module = bundle id 把 `.` 换成 `_`)
 - 开发期 entitlements 用**裸值** `app-proxy-provider`(与自动生成的
   Development profile 一致);分发改 `app-proxy-provider-systemextension`
-  + Developer ID profile + 公证。
+  + Developer ID profile + 公证。公证用 notarytool(端点
+  `appstoreconnect.apple.com/notary/v2/` 直连可达,需 App Store Connect
+  API key——完整流程见 GUIDE §3.4)。
 
 ## 3. 构建
 

@@ -24,8 +24,8 @@
 | 激活 Code=8 `Invalid code signature or missing entitlements` | ① entitlements 值与 profile 不一致 ② `get-task-allow` 注入 ③ 证书链无效 | ① 对齐字面值(开发期=裸值) ② `CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO` ③ `codesign --verify --deep --strict` |
 | 激活 Code=3 `must be in /Applications folder` | host 不在 /Applications | `cp -R` 过去(xattr -rc 清属性) |
 | 激活 Code=4 `Extension not found`(部署后) | ① Info.plist 与请求 identifier 不一致 ② **db 双记录死锁** | ① 核对 extensionBundleID ② `systemextensionsctl list` 看两条记录 → 重启 |
-| 卡 `[validating by category]` | ① Developer ID 未公证 + 公证 API 不通 ② provider 反复崩溃使 NE 校验挂起 | ① 换 Apple Development 路线 ② 先修 provider(见 D) |
-| `-67050 代码未能满足指定的代码要求` | 公证校验失败(notarization daemon err 3 = 在线查询被断) | Apple Development 路线,或换能通公证的网络公证+staple |
+| 卡 `[validating by category]` | ① Developer ID 未公证 ② provider 反复崩溃使 NE 校验挂起 | ① notarytool 公证(端点 appstoreconnect.apple.com/notary/v2/ 直连可达,见 GUIDE §3.4) ② 先修 provider(见 D) |
+| `-67050 代码未能满足指定的代码要求` | 公证校验失败(无公证票据,Gatekeeper 在线查票不通) | notarytool 公证 + stapler staple(见 GUIDE §3.4);开发期换 Apple Development 路线 |
 | `spctl --master-disable` 后仍被拒 | sysextd 校验独立于 Gatekeeper 全局开关 | 无效操作,别浪费时间 |
 | 激活后 `[terminated waiting to uninstall on reboot]` | 版本被替换,旧版待卸 | 正常,重启后消失 |
 

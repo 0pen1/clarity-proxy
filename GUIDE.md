@@ -115,12 +115,27 @@ include/exclude 后把 flow 双向泵到 direct/SOCKS5 上游。
 
 - 未公证的 Developer ID 扩展在 category 校验阶段被拒:
   `Error checking with notarization daemon: 3` → `-67050 代码未能满足指定的代码要求`。
-- 本机公证 API(`api.notarization-service.apple.com`、`gc.apple.com`)被网络阻断,
-  走本机代理(Clash 7897)也 TLS 被重置 → 无法自行公证。
+- ~~本机公证 API(`api.notarization-service.apple.com`、`gc.apple.com`)被网络阻断,
+  走本机代理(Clash 7897)也 TLS 被重置 → 无法自行公证。~~
+  **注(2026-09-16 修正):这是误判**——`api.notarization-service.apple.com` 是 altool
+  时代的旧 notary API(2023-11 已停用),`notarytool` 根本不连它。从 notarytool 二进制
+  抽取的真实端点只有一个:`https://appstoreconnect.apple.com/notary/v2/`。
+  实测该域名**直连即通**(无凭证返回 401,服务器正常响应)——公证无网络障碍。
+  当时"走 Clash 也 TLS 被重置"的现象是旧域名/旧节点的组合,对本机公证流程无参考价值。
 - `spctl --master-disable`(Gatekeeper 关闭)**不能**豁免 sysextd 的独立校验路径。
 - `stapler validate` 对已公证 app(如 Proxifier)工作正常 → trustd 本身健康,
   只是"无票据 + 在线查询不通"必拒。
-- **结论**:开发期用 Apple Development 路线绕开公证;正式分发必须公证+staple。
+- **结论(修正)**:开发期用 Apple Development 路线;正式分发走 notarytool 公证
+  (需 App Store Connect API key)。流程:
+  1. 从内向外签:先 `codesign` sysex(`--options runtime --timestamp` +
+     devid entitlements 带后缀值 `app-proxy-provider-systemextension`),再签 host app;
+  2. `ditto -c -k --keepParent NetProxy.app NetProxy.zip`(不能直接传 .app;
+     ditto 保留符号链接/权限,普通 zip 会坏);
+  3. `xcrun notarytool submit NetProxy.zip -p <keychain-profile> --wait`
+     (凭证先用 `notarytool store-credentials` 存钥匙串;失败看
+     `notarytool log <submission-id>`);
+  4. `xcrun stapler staple NetProxy.app` + `stapler validate` +
+     `spctl --assess -t exec -vvv`。
 
 ---
 
