@@ -1098,7 +1098,8 @@ struct MonitorSection: View {
                 }
                 .buttonStyle(.link)
                 .disabled(state.busy)
-                .help("从运行中的进程选择要监控的 pid（进程树语义，含未来子进程）")
+                .keyboardShortcut("n", modifiers: .command)
+                .help("从运行中的进程选择要监控的 pid（进程树语义，含未来子进程）⌘N")
             }
             let pids = state.statusDetail?.pids ?? []
             if pids.isEmpty {
