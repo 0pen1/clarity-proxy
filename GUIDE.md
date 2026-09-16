@@ -278,6 +278,37 @@ settings.excludedNetworkRules = [
 **解法**: `sudo kill -9 <pid>`;或重启一劳永逸。长期修法是 host 在
 deactivate 完成后确认 provider 进程退出再 activate。
 
+### 坑 18: 换仓库/构建链变更后产物配置链断裂（2026-09-16 实录）⭐️
+
+从原始仓库迁移到独立仓库后直接 `xcodebuild`,两处静默断裂(编译全绿、
+activate 成功,但 NESM `Plugin failed` / `started with PID 0`):
+
+1. **NEProviderClasses 类名占位符未注入**——build.sh 的 `${MODULE_NAME}`
+   注入只在 `DEVELOPMENT_TEAM` 环境变量存在时执行,直接 xcodebuild 不传
+   变量时占位符裸奔进产物(`.Provider`)→ NESM 找不到 Provider 类。
+   排查: `plutil -p <sysex>/Contents/Info.plist | grep -A2 NEProviderClasses`
+   验证类名 = `<module>.Provider`(module = 二进制里 `_TtC35<module>...`
+   mangled 名)。**修复**: 模板直接写死正确类名。
+2. **embedded.provisionprofile 与 entitlements 值错配**——Xcode 自动签名
+   选了 Developer ID profile(要求 `app-proxy-provider-systemextension`
+   后缀值)而 entitlements 还是开发期裸值 `app-proxy-provider` → AMFI
+   校验失败 → NESM spawn 返回 PID 0。
+   排查: `security cms -D -i <sysex>/Contents/embedded.provisionprofile |
+   plutil -p -` 对照 entitlements 值。**修复**: 让 Xcode 选回 Mac Team
+   Development profile(裸值匹配)。
+
+**核心教训**: 迁移构建链后"能编译 + activate 报 active"≠ 产物可用;每次
+部署变更后用 `start` 的 `✓ verified`(connected + startProxy 落盘验证)
+确认,不信 `proxy started` 字样。
+
+### 坑 19: async 版 handleAppMessage override 风险
+
+Swift async 版 `override func handleAppMessage(_:) async -> Data` 在
+macOS 14.4 上疑似与 NEProvider 的 ObjC 派发不兼容(曾表现为 Plugin failed,
+当时与坑 18 叠加无法归因)。**安全形态**: completion 版
+`handleAppMessage(_:completionHandler:)`(参数类型 `((Data?) -> Void)?`,
+注意 optional)。
+
 ---
 
 ## 5. 调试方法论(这套问题排查流程可直接复用)
