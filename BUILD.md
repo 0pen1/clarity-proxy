@@ -107,6 +107,23 @@ systemextensionsctl list   # 目标状态: [activated enabled]
 > 激活失败排查: 见 DEBUGGING.md B 节。最常见是 profile 与 entitlements
 > 值不一致(开发期必须是裸值 `app-proxy-provider`)。
 
+## 4.5 GUI 模式（v3.3+）
+
+无参数启动 = 菜单栏 GUI；带参数 = CLI。两者共用同一控制面（NE 配置 + 热更通道），可混用：
+
+```bash
+open /Applications/NetProxy.app   # 菜单栏图标（盾牌）→ 点开面板
+```
+
+- 状态灯：绿=connected / 红=未激活或未配置 / 橙=连接中
+- 监控区「+ 添加监控…」：进程选择器（sysctl 枚举 + 搜索名称/pid，root 进程只显示名+pid）
+- 出口：直连 / SOCKS5（host:port）/ 网关 三档
+- ⚙ 菜单：激活扩展（首次弹系统设置批准）/ 停用 / 卸载配置（确认）/ 复制诊断命令
+- 单实例守卫：已有 GUI 运行时再 open 只激活既有实例
+
+> 注意：**版本升级（替换 /Applications 里的 app）后先退出菜单栏 GUI**（图标右键退出）再部署，
+> 否则旧实例持着 bundle 路径，新二进制不生效。
+
 ## 5. 运行验证
 
 ```bash
