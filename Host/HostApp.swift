@@ -3,6 +3,8 @@ import Darwin
 import NetworkExtension
 import SystemExtensions
 import OSLog
+import AppKit
+import SwiftUI
 
 // MARK: - 系统扩展安装器
 
@@ -541,7 +543,269 @@ enum ProxyCtl {
     }
 }
 
-// MARK: - 入口
+// MARK: - GUI（菜单栏应用）
+
+/// async main 进 AppKit 主线程的标准跳转：全部 UI 工作 MainActor 上，
+/// NSApplication.run() 阻塞直到退出（此时 async main 继续走到 exit(0)）。
+extension HostApp {
+    static func runGUI() async {
+        await MainActor.run {
+            let app = NSApplication.shared
+            let delegate = MenuBarAppDelegate()
+            app.delegate = delegate
+            app.setActivationPolicy(.accessory)   // LSUIElement 语义（plist 也标了，双保险）
+            _ = NSApplication.shared          // 确保已初始化
+            app.run()
+        }
+    }
+}
+
+/// 单实例守卫 + 菜单栏生命周期。NSApplicationDelegate 的非文档化生命周期方法
+/// 在 Swift 里用 NSObject 扩展补充（applicationDidFinishLaunching 在此处可达）。
+final class MenuBarAppDelegate: NSObject, NSApplicationDelegate {
+    var controller: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 单实例：已有 NetProxy GUI 实例在跑 → 激活它的菜单栏（无窗口可聚焦，仅提示）并退出
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+        let others = running.filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if let first = others.first {
+            _ = first.activate(options: [])
+            NSApplication.shared.terminate(self)
+            return
+        }
+        controller = MenuBarController()
+    }
+}
+
+/// 菜单栏图标 + Popover 壳：NSStatusItem + NSPopover + NSHostingView(SwiftUI)。
+@MainActor
+final class MenuBarController: NSObject, NSPopoverDelegate {
+    let statusItem: NSStatusItem
+    let popover: NSPopover
+    let appState: AppState
+
+    override init() {
+        // 状态映射到 SF Symbols：连接=实心盾、已停=空盾、未激活=斜杠盾
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.image = NSImage(systemSymbolName: "shield", accessibilityDescription: "NetProxy")
+        popover = NSPopover()
+        appState = AppState()
+        super.init()
+        appState.onIconChange = { [weak self] symbol in
+            self?.statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "NetProxy")
+        }
+        popover.contentSize = NSSize(width: 380, height: 320)
+        popover.behavior = .transient                    // 点外部自动关
+        popover.contentViewController = NSHostingController(rootView: RootView(state: appState))
+        popover.delegate = self
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(togglePopover(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    @objc func togglePopover(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        // 右键 = 直接退出（无窗口 app 唯一的显式出口；代理继续跑）
+        if event?.type == .rightMouseUp {
+            NSApp.terminate(nil)
+            return
+        }
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            appState.refreshNow()
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        }
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        appState.startPolling()
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        appState.stopPolling()
+    }
+}
+
+// MARK: - GUI 状态与动作（ObservableObject）
+
+/// GUI 状态头信息 + 动作编排。所有 NE 操作 Task 化，busy 门控防并发。
+@MainActor
+final class AppState: ObservableObject {
+    @Published var statusText = "读取中…"
+    @Published var statusColor = Color.gray
+    @Published var iconSymbol = "shield"
+    @Published var enabled = false
+    @Published var connected = false
+    @Published var busy = false
+    @Published var toast: String? = nil
+    @Published var lastActionText = "—"
+    @Published var statusDetail: ProxyStatus? = nil
+
+    var onIconChange: ((String) -> Void)? = nil
+
+    private var pollTask: Task<Void, Never>? = nil
+
+    init() {
+        refreshNow()
+    }
+
+    func refreshNow() {
+        Task { @MainActor in
+            let s = try? await ProxyCtl.readStatus()
+            self.applyStatus(s)
+        }
+    }
+
+    func startPolling() {
+        stopPolling()
+        pollTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let s = try? await ProxyCtl.readStatus()
+                self.applyStatus(s)
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+    }
+
+    func stopPolling() {
+        pollTask?.cancel()
+        pollTask = nil
+    }
+
+    private func applyStatus(_ s: ProxyStatus?) {
+        statusDetail = s
+        if let s = s {
+            enabled = s.enabled
+            connected = (s.statusRaw == 3)
+            switch (s.enabled, s.statusRaw) {
+            case (true, 3): statusText = "已连接"; statusColor = .green
+            case (true, _): statusText = "连接中…"; statusColor = .orange
+            case (false, _): statusText = "已停止"; statusColor = .blue
+            }
+            iconSymbol = (s.enabled && s.statusRaw == 3) ? "shield.fill" : "shield"
+        } else {
+            enabled = false
+            connected = false
+            statusText = "未激活或未配置"
+            statusColor = .red
+            iconSymbol = "shield.slash"
+        }
+        onIconChange?(iconSymbol)
+    }
+
+    // MARK: 动作
+
+    func doStart() {
+        guard !busy else { return }
+        busy = true
+        toast = "启动中…"
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.apply(patch: ProxyPatch(), enable: true) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "启动失败: \(error.localizedDescription)"
+            }
+    }
+    }
+
+    func doStop() {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.apply(patch: ProxyPatch(), enable: false) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "停止失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func handleEvent(_ event: ApplyEvent) {
+        switch event {
+        case .hotReloaded(let match, _, _, _):
+            toast = "✓ 已即时生效（热更）：\(match)"
+        case .hotReloadFallback:
+            toast = "⚠️ 热更未获回执——已回退重启隧道"
+        case .staleProvider(let pid, let etime):
+            toast = "⚠️ 检测到旧扩展进程 pid \(pid)（存活 \(etime)），建议 sudo kill -9 \(pid)"
+        case .waitTimeout, .startProxyMissing:
+            toast = "⚠️ 僵尸 provider 特征——停止后重试，或 sudo pkill -9 -f local.netproxy"
+        case .started(let pids, _, _, _):
+            toast = "✓ 启动成功（监控 pid: \(pids)）"
+        case .stopped:
+            toast = "已停止"
+        case .missingPid(let p):
+            toast = "⚠️ pid \(p) 不存在——规则将不会命中任何流量"
+        case .badConfig(let msg):
+            toast = "✗ \(msg)"
+        }
+    }
+}
+
+// MARK: - GUI 视图
+
+/// Popover 根视图：状态头 + 主按钮 + 摘要（Step 2 壳，后续步扩展）。
+struct RootView: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Circle()
+                    .fill(state.statusColor)
+                    .frame(width: 10, height: 10)
+                Text(state.statusText).font(.headline)
+                Spacer()
+                Text("NetProxy v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            if let d = state.statusDetail {
+                VStack(alignment: .leading,  spacing: 4) {
+                    Text("出口: \(d.upstreamMode)://\(d.upstreamHost):\(d.upstreamPort)")
+                    Text("IPC: \(d.ipcDesc)")
+                    Text("匹配: \(d.matchDesc)")
+                }
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.secondary)
+            } else {
+                Text("扩展未配置——见下方说明").font(.caption).foregroundColor(.secondary)
+            }
+            Divider()
+            HStack {
+                Button(action: { state.doStart() }) {
+                    Label("启动代理", systemImage: "play.fill")
+                }
+                .disabled(state.enabled && state.connected || state.busy)
+                .help("启动透明代理（规则沿用现有配置）")
+                Button(action: { state.doStop() }) {
+                    Label("停止代理", systemImage: "stop.fill")
+                }
+                .disabled(!(state.statusDetail?.enabled ?? false) || state.busy)
+                .help("停止透明代理（配置保留）")
+            }
+            if state.busy {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(state.toast ?? "处理中…").font(.caption)
+                }
+            }
+            if !state.busy, let t = state.toast {
+                Text(t).font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+        .padding(14)
+        .frame(width: 380, height: 320)
+    }
+}
 
 @main
 struct HostApp {
@@ -549,6 +813,11 @@ struct HostApp {
         let allArgs = Array(CommandLine.arguments.dropFirst())
             .filter { $0 != "YES" && $0 != "NO" && !$0.hasPrefix("-NS") && $0 != "-session" }
         // 忽略 Xcode 注入的调试参数(-NSDocumentRevisionsDebugMode YES 等),保留 --include 等 CLI 选项
+        // GUI 模式：无参数启动（Finder 双击 / open）→ 菜单栏应用；有参数 → CLI
+        if allArgs.isEmpty {
+            await HostApp.runGUI()
+            exit(0)
+        }
         var cmd = allArgs.first ?? "help"
         // apply 的参数 = 去掉命令词后的剩余项
         let args = Array(allArgs.dropFirst())
