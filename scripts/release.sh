@@ -20,17 +20,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VER="${1:?用法: ./scripts/release.sh <版本号> [build号] [--notes \"...\"]"
+VER="${1:?usage: release.sh <version> [build] [--notes text]}"
 BUILD="${2:-}"
 # build 号缺省 = 25 起递增？不可靠——用日期时分（如 25091620）保证单调递增
 if ! [[ "$BUILD" =~ ^[0-9]+$ ]]; then
   BUILD=$(date +%y%m%d%H%M)
 fi
-NOTES_ARG=""
-for a in "$@"; do
-  [[ "$a" == "--notes" ]] && NOTES_ARG=1
-done
-
 echo "════════════════════════════════════════════"
 echo "  clarity-proxy release v$VER (build $BUILD)"
 echo "════════════════════════════════════════════"
