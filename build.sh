@@ -20,12 +20,13 @@ fi
 
 # Team ID / bundle ID 参数化：DEVELOPMENT_TEAM 环境变量必填（首次），注入 project.yml 占位符。
 # bundle ID 形态 local.clarity.<team小写>[.extension]——fork 用户得到自己的独立标识。
+# 注：sed 表达式用单引号包住 ${占位符} 字面量（防 shell 展开 unbound 变量），替换值用双引号拼接。
 if [ -n "${DEVELOPMENT_TEAM:-}" ]; then
   TEAM_LC=$(echo "$DEVELOPMENT_TEAM" | tr 'A-Z' 'a-z')
   /usr/bin/sed -i.bak \
-    -e "s/\\${DEVELOPMENT_TEAM}/${DEVELOPMENT_TEAM}/" \
-    -e "s/\\${DEVELOPMENT_TEAM_LC}/${TEAM_LC}/g" project.yml && rm -f project.yml.bak
-  /usr/bin/sed -i.bak "s/\\${MODULE_NAME}/local_clarity_${TEAM_LC}_extension/" netproxy/ext-Info.plist && rm -f netproxy/ext-Info.plist.bak
+    -e 's/${DEVELOPMENT_TEAM}/'"${DEVELOPMENT_TEAM}"'/' \
+    -e 's/${DEVELOPMENT_TEAM_LC}/'"${TEAM_LC}"'/g' project.yml && rm -f project.yml.bak
+  /usr/bin/sed -i.bak 's/${MODULE_NAME}/local_clarity_'"${TEAM_LC}"'_extension/' netproxy/ext-Info.plist && rm -f netproxy/ext-Info.plist.bak
   echo "DEVELOPMENT_TEAM=${DEVELOPMENT_TEAM} (bundle: local.clarity.${TEAM_LC}) written"
 fi
 

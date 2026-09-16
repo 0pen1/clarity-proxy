@@ -254,11 +254,119 @@ enum ProxyCtl {
         try await manager.saveToPreferences()
         try await manager.loadFromPreferences()
         if enable {
+            // ---- 防假成功三件套（真机教训：proxy started/status:3 都会骗人）----
+            // 1. start 前清场：扩展进程存活且年龄 > 90s（不可能属于本次 start
+            //    生命周期）时，NESM 会复用它——新配置不会加载。提示并给出杀进程命令。
+            await ProxyCtl.checkStaleProvider()
+
             try manager.connection.startVPNTunnel()
+
+            // 2. 等 connected（startVPNTunnel 只是请求，隧道真正起来需要时间）。
+            let connected = await ProxyCtl.waitConnected(timeout: 15)
+            guard connected else {
+                print("⚠️  proxy started 但 15s 内未 connected——僵尸 provider 特征：")
+                print("   1) 重试: $APP stop && sleep 5 && $APP start ...")
+                print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
+                print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
+                print("   诊断: /usr/bin/log show --last 2m --info --debug --predicate 'process == \"nesessionmanager\" AND eventMessage CONTAINS \"NetProxy\"'")
+                return
+            }
+
+            // 3. 端到端验证：startProxy 是否真的加载了新配置——看 provider 日志里
+            //    本次 start 之后是否出现 "starting:" 行（Logger 需 --info --debug 落盘，
+            //    这里用 subprocess 直接查 log store）。
+            let startingOK = await ProxyCtl.verifyStartProxyLogged()
+            if !startingOK {
+                print("⚠️  connected 但 provider 未执行 startProxy（配置未加载）——")
+                print("   NESM 复用了旧 provider 进程。处置同上：pkill 后重试，或重启 Mac。")
+                return
+            }
             print("proxy started (match: pids=\(mergedPids) include=\(mergedInclude) tree=\(effTreeMode))")
+            print("✓ verified: connected + startProxy loaded (config: pid=\(mergedPids) include=\(mergedInclude))")
         } else {
             print("proxy stopped (config saved, disabled)")
         }
+    }
+
+    /// 扩展进程年龄检查：进程启动时间早于 90 秒前 = 它不属于本次 start，
+    /// NESM 将复用它（新配置不会加载）。只警告不自动杀（需要 sudo）。
+    static func checkStaleProvider() async {
+        // pgrep 找扩展进程
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        proc.arguments = ["-f", "local.netproxy.*extension.systemextension"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch { return }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let pids = String(data: data, encoding: .utf8)?
+            .split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) } ?? []
+        guard let pid = pids.first else { return }
+        // 进程启动时间：ps -o lstart
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-o", "lstart=", "-p", String(pid)]
+        let psPipe = Pipe()
+        ps.standardOutput = psPipe
+        ps.standardError = Pipe()
+        do { try ps.run(); ps.waitUntilExit() } catch { return }
+        let started = String(data: psPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !started.isEmpty else { return }
+        // 解析 "Wed Sep 16 13:56:26 2026" —— 简化：用 etime（elapsed）更稳。
+        let et = Process()
+        et.executableURL = URL(fileURLWithPath: "/bin/ps")
+        et.arguments = ["-o", "etime=", "-p", String(pid)]
+        let etPipe = Pipe()
+        et.standardOutput = etPipe
+        et.standardError = Pipe()
+        do { try et.run(); et.waitUntilExit() } catch { return }
+        let etime = String(data: etPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // etime 形如 "1-02:03:04"（天:时:分:秒）或 "02:03"（分:秒）
+        let secs = etime.split(separator: "-").flatMap { $0.split(separator: ":").compactMap { Int($0) } }.reduce(0) { $0 * 60 + $1 }
+        if secs > 90 {
+            print("⚠️  检测到运行中的扩展进程（pid \(pid)，已存活 \(etime)）——")
+            print("   它早于本次 start，NESM 将复用它且不会加载新配置。")
+            print("   强烈建议先: sudo kill -9 \(pid) && sleep 2  再 start（本命令未自动执行，需要 sudo）")
+        }
+    }
+
+    /// 轮询 connection status 直到 connected 或超时。
+    static func waitConnected(timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let managers = (try? await NETransparentProxyManager.loadAllFromPreferences()) ?? []
+            if let m = managers.first(where: {
+                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+                    == ProxyCtl.extensionBundleID
+            }), m.connection.status == .connected {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return false
+    }
+
+    /// 端到端验证：provider 日志在本进程 start 后是否出现 "starting:"（startProxy 执行）。
+    /// 真机教训：status:3 也可能是假成功（老 provider 不重跑 startProxy）。
+    static func verifyStartProxyLogged() async -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        proc.arguments = ["show", "--last", "1m", "--info", "--debug",
+                          "--predicate", "subsystem == \"local.clarity\" AND category == \"extension\"",
+                          "--style", "compact"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do { try proc.run(); proc.waitUntilExit() } catch { return true } // log 失败不阻塞 start
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let out = String(data: data, encoding: .utf8) ?? ""
+        return out.contains("starting: mode=")
     }
 
     static func uninstallConfig() async throws {
