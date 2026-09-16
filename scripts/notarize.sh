@@ -29,11 +29,16 @@ security find-identity -v -p codesigning | grep -q "$CERT" || {
 [ -d "$APP" ] || { echo "✗ 未找到构建产物 $APP（先 ./build.sh）"; exit 1; }
 echo "✓ 证书与产物就位"
 
-echo "=== 1. 嵌套签名（内 → 外）==="
-# sysex 先签（Developer ID + devid entitlements + Hardened Runtime + timestamp）
+echo "=== 1. 嵌套签名（内 → 外：dylib → sysex → host）==="
+# 所有嵌套 dylib 逐个签（公证要求每个二进制独立 Developer ID + timestamp；
+# --deep 不覆盖 Frameworks 内的 dylib 签名——首次提交 Invalid 的根因）
+find "$APP/Contents/Frameworks" -name "*.dylib" 2>/dev/null | while read -r dylib; do
+  codesign --force --sign "$CERT" --options runtime --timestamp "$dylib"
+done
+# sysex 签（devid entitlements）
 codesign --force --sign "$CERT" \
   --entitlements "$E/ext-devid.entitlements" \
-  --options runtime --timestamp --deep "$SYSEX"
+  --options runtime --timestamp "$SYSEX"
 # host 后签（外层覆盖内层签名）
 codesign --force --sign "$CERT" \
   --entitlements "$E/host-devid.entitlements" \
