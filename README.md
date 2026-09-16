@@ -17,7 +17,21 @@ AI agent 跑在你的 Mac 上，它调用的每个子进程都在联网。clarit
 
 无 TUN 设备、无 pf 规则、无注入——**对目标进程完全透明**。
 
+## Install (Homebrew)
+
+```bash
+brew tap 0pen1/tap https://github.com/0pen1/homebrew-tap
+brew trust 0pen1/tap
+brew install --cask netproxy
+# One-time activation (manual, requires admin approval):
+/Applications/NetProxy.app/Contents/MacOS/NetProxy activate
+```
+
+Releases are notarized (Developer ID + staple) — no Xcode or developer-account registration needed on the target machine.
+
 ## Quick start
+
+## Quick start (from source)
 
 ```bash
 # 1. 构建（需要付费 Apple Developer 账号，详见 BUILD.md）
