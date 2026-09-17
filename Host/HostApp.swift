@@ -1191,8 +1191,11 @@ struct ProcessPicker: View {
         .padding(14)
         .frame(width: 380, height: 420)
         .task {
-            // 后台枚举（~几百进程），完成回主线程
-            let rows = ProcessList.enumerate()
+            // 枚举是同步 syscall 循环（几百进程 × proc_pidpath），在 MainActor
+            // 上跑会冻住整个 UI（含 ProgressView 和点击响应）。甩到后台线程。
+            let rows = await Task.detached(priority: .userInitiated) {
+                ProcessList.enumerate()
+            }.value
             processes = rows
             loaded = true
         }
