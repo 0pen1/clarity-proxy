@@ -197,6 +197,116 @@ enum ProcessList {
     }
 }
 
+// MARK: - NE 看门狗
+
+/// NE 框架缺陷（真机 2026-09-17 四次复现，三个进程 53350/70634/81464 同模式）：
+/// GUI 进程首次 loadAllFromPreferences 成功，空闲 ~10 分钟后再次调用永不返回。
+/// 证据：挂死调用在 nehelper 连接建立之前就断流（CLI 对照组完整走
+/// nehelper → load command → Clearing/Adding）——NE 框架进程内缓存的 XPC
+/// 连接被服务端作废后不重连、completion 永不回调。
+///
+/// v3 双层修复：
+/// 1. 治本——AppState 45s keepalive 常驻轮询：连接不闲置，挂死源头消除；
+///    面板打开时状态已就绪（keepalive 间隔内最多 45s 旧数据）。
+/// 2. 兜底——看门狗全部跑在 libdispatch 串行队列（与 Swift 协作线程池、
+///    AppKit、NE XPC 全隔离），asyncAfter 超时必然触发（v2 的 Task.detached
+///    + semaphore 赛跑在真机挂死场景静默失效——sema.wait() 同步阻塞协作
+///    线程是并发编程禁止的模式，池退化时超时任务永远没机会跑）。
+///    连续 2 次 8s 超时 → execv 原地替换进程映像（同 pid，不碰隧道/扩展，
+///    不走 NSApp.terminate——它可能被挂死的 XPC 阻塞）。
+enum NEWatchdogError: Error { case timeout(String) }
+
+/// 看门狗一次性标志（引用类型，跨并发闭包捕获合法）。
+private final class WDBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+    /// 已被占用返回 true；首次调用占用并返回 false。
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if claimed { return true }
+        claimed = true
+        return false
+    }
+}
+
+
+extension NETransparentProxyManager {
+    /// 看门狗超时回调跑在专属串行队列（dispatchWd），与协作池隔离。
+    private static let wdQueue = DispatchQueue(label: "local.clarity.watchdog")
+
+    /// 带 dispatch 看门狗的 loadAllFromPreferences：先发 NE 调用，8s 内
+    /// 无回执则抛 NEWatchdogError。返回值经 completion 桥接（协作池恢复执行）。
+    static func loadAllWD(_ timeout: TimeInterval = 8) async throws -> [NETransparentProxyManager] {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[NETransparentProxyManager], Error>) in
+            let done = WDBox()
+            // 超时票：libdispatch 定时器，与协作池/AppKit/XPC 全隔离
+            wdQueue.asyncAfter(deadline: .now() + timeout) {
+                hostLog.info("WD: 看门狗定时器触发（\(timeout)s）")
+                if done.claim() { return }
+                hostLog.error("WD: loadAllFromPreferences 超时，抛 NEWatchdogError")
+                cont.resume(throwing: NEWatchdogError.timeout("loadAllFromPreferences \(timeout)s 未返回"))
+            }
+            Task.detached {
+                hostLog.info("WD: loadAllFromPreferences 开始")
+                do {
+                    let r = try await NETransparentProxyManager.loadAllFromPreferences()
+                    hostLog.info("WD: loadAllFromPreferences 返回 \(r.count) 条")
+                    if done.claim() { return }
+                    cont.resume(returning: r)
+                } catch {
+                    hostLog.info("WD: loadAllFromPreferences 抛错 \(String(describing: error))")
+                    if done.claim() { return }
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// saveToPreferences 同型看门狗。
+    func saveWD(_ timeout: TimeInterval = 8) async throws {
+        let m = self
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let done = WDBox()
+            Self.wdQueue.asyncAfter(deadline: .now() + timeout) {
+                if done.claim() { return }
+                cont.resume(throwing: NEWatchdogError.timeout("saveToPreferences \(timeout)s 未返回"))
+            }
+            Task.detached {
+                do {
+                    try await m.saveToPreferences()
+                    if done.claim() { return }
+                    cont.resume()
+                } catch {
+                    if done.claim() { return }
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// loadFromPreferences 同型看门狗。
+    func loadWD(_ timeout: TimeInterval = 8) async throws {
+        let m = self
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let done = WDBox()
+            Self.wdQueue.asyncAfter(deadline: .now() + timeout) {
+                if done.claim() { return }
+                cont.resume(throwing: NEWatchdogError.timeout("loadFromPreferences \(timeout)s 未返回"))
+            }
+            Task.detached {
+                do {
+                    try await m.loadFromPreferences()
+                    if done.claim() { return }
+                    cont.resume()
+                } catch {
+                    if done.claim() { return }
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - 代理配置启停
 
 enum ProxyCtl {
@@ -307,7 +417,7 @@ enum ProxyCtl {
     static func apply(patch: ProxyPatch, enable: Bool,
                       report: @escaping (ApplyEvent) -> Void) async throws {
         // 读取现有配置（merge 基线）。
-        let managers = try await NETransparentProxyManager.loadAllFromPreferences()
+        let managers = try await NETransparentProxyManager.loadAllWD()
         let manager = managers.first { m in
             (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                 == ProxyCtl.extensionBundleID
@@ -384,8 +494,8 @@ enum ProxyCtl {
         manager.localizedDescription = "NetProxy"
         manager.isEnabled = enable
 
-        try await manager.saveToPreferences()
-        try await manager.loadFromPreferences()
+        try await manager.saveWD()
+        try await manager.loadWD()
         if enable {
             // ---- 防假成功三件套（真机教训：proxy started/status:3 都会骗人）----
             // 1. start 前清场：扩展进程存活且年龄 > 90s（不可能属于本次 start
@@ -497,7 +607,7 @@ enum ProxyCtl {
     static func waitConnected(timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            let managers = (try? await NETransparentProxyManager.loadAllFromPreferences()) ?? []
+            let managers = (try? await NETransparentProxyManager.loadAllWD()) ?? []
             if let m = managers.first(where: { m2 in
                 (m2.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                     == ProxyCtl.extensionBundleID
@@ -527,10 +637,10 @@ enum ProxyCtl {
     }
 
     static func uninstallConfig() async throws {
-        let managers = try await NETransparentProxyManager.loadAllFromPreferences()
+        let managers = try await NETransparentProxyManager.loadAllWD()
         for m in managers where (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == ProxyCtl.extensionBundleID {
             m.isEnabled = false
-            try await m.saveToPreferences()
+            try await m.saveWD()
             try await m.removeFromPreferences()
         }
         print("configuration removed")
@@ -538,7 +648,7 @@ enum ProxyCtl {
 
     /// status 的结构化版：未配置返回 nil。
     static func readStatus() async throws -> ProxyStatus? {
-        let managers = try await NETransparentProxyManager.loadAllFromPreferences()
+        let managers = try await NETransparentProxyManager.loadAllWD()
         guard let m = managers.first(where: { m2 in
             (m2.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                 == ProxyCtl.extensionBundleID
@@ -593,18 +703,20 @@ enum ProxyCtl {
 
 // MARK: - GUI（菜单栏应用）
 
-/// async main 进 AppKit 主线程的标准跳转：全部 UI 工作 MainActor 上，
-/// NSApplication.run() 阻塞直到退出（此时 async main 继续走到 exit(0)）。
+/// GUI 主入口。关键约束（真机 5 次复现的教训）：不能在 `MainActor.run {}` 块内调
+/// `app.run()`——那会占死主队列的一个 drain 块，之后投递到主队列的 NE completion
+/// 与 MainActor 任务（init 期创建的 keepalive/refreshNow Task）永远不被调度，
+/// 表现为 GUI 永远「读取中…」。正确形态是同步进入 app.run()：主线程 runloop
+/// 正常服务主队列，NE 回调与 MainActor 任务都能执行。
 extension HostApp {
-    static func runGUI() async {
-        await MainActor.run {
-            let app = NSApplication.shared
-            let delegate = MenuBarAppDelegate()
-            app.delegate = delegate
-            app.setActivationPolicy(.accessory)   // LSUIElement 语义（plist 也标了，双保险）
-            _ = NSApplication.shared          // 确保已初始化
-            app.run()
-        }
+    @MainActor
+    static func runGUI() {
+        let app = NSApplication.shared
+        let delegate = MenuBarAppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)   // LSUIElement 语义（plist 也标了，双保险）
+        app.run()
+        exit(0)
     }
 }
 
@@ -695,9 +807,12 @@ final class AppState: ObservableObject {
     var onIconChange: ((String) -> Void)? = nil
 
     private var pollTask: Task<Void, Never>? = nil
+    private var keepaliveTask: Task<Void, Never>? = nil
+    private var wdFailCount = 0
 
     init() {
         refreshNow()
+        startKeepalive()   // 45s 常驻：NE XPC 连接不闲置（挂死根因的治本层）
     }
 
     /// 监控区"添加监控"按钮 → RootView 监听 pickerRequested 弹 sheet。
@@ -705,19 +820,90 @@ final class AppState: ObservableObject {
         pickerRequested = true
     }
 
+    /// 看门狗自愈（v3）：execv 原地替换进程映像——同 pid、不经 NSApp.terminate
+    /// （它可能被挂死的 XPC 阻塞）、不碰隧道/扩展（独立进程）。恢复动作跑在
+    /// libdispatch 队列，与挂死的协作池完全隔离，必然可达。先落文件证据。
+    private func recoverFromNEHang() {
+        let marker = "recovery at \(Date())\n"
+        try? marker.write(toFile: "/tmp/netproxy-recovery.log", atomically: true, encoding: .utf8)
+        hostLog.error("NE watchdog fired — execv restarting GUI (tunnel untouched)")
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.8) {
+            // execv：进程映像替换，菜单栏图标由新实例重建，单实例守卫不触发
+            // （exec 不产生第二个进程）。GUI 无参重启 = 菜单栏模式。
+            let exe = Bundle.main.bundlePath + "/Contents/MacOS/NetProxy"
+            let argv: [UnsafeMutablePointer<CChar>?] = [strdup(exe), nil]
+            execv(exe, argv)
+            // execv 只在失败时返回——进程内已有挂死状态，直接 _exit 让 launchd/
+            // 用户感知。正常路径永不走到这里。
+            _exit(1)
+        }
+    }
+
     func refreshNow() {
+        hostLog.info("refreshNow 开始")
         Task { @MainActor in
-            let s = try? await ProxyCtl.readStatus()
-            self.applyStatus(s)
+            do {
+                let s = try await ProxyCtl.readStatus()
+                hostLog.info("refreshNow 成功 enabled=\(s?.enabled ?? false)")
+                self.applyStatus(s)
+            } catch is NEWatchdogError {
+                self.recoverFromNEHang()
+            } catch {
+                hostLog.error("refreshNow 异常 \(String(describing: error))")
+                self.applyStatus(nil)
+            }
+        }
+    }
+
+    /// 常驻 keepalive（v3 治本）：45s 一次 status 查询。NE 框架的进程内 XPC
+    /// 连接在长时间闲置后被服务端作废且不重连（挂死根因）——定期使用让连接
+    /// 永不闲置。轮询开销极低（本地 XPC 往返 <10ms）。面板打开时若状态尚新
+    /// （<2s）直接复用，否则立即刷新。
+    func startKeepalive() {
+        guard keepaliveTask == nil else { return }
+        hostLog.info("startKeepalive: 创建 Task 前")
+        keepaliveTask = Task { @MainActor in
+            var round = 0
+            while !Task.isCancelled {
+                round += 1
+                hostLog.info("keepalive 第 \(round) 轮开始")
+                do {
+                    let s = try await ProxyCtl.readStatus()
+                    hostLog.info("keepalive 第 \(round) 轮成功 enabled=\(s?.enabled ?? false)")
+                    self.applyStatus(s)
+                    wdFailCount = 0
+                } catch is NEWatchdogError {
+                    wdFailCount += 1
+                    hostLog.error("keepalive 第 \(round) 轮超时（第 \(self.wdFailCount) 次）")
+                    if wdFailCount >= 2 { self.recoverFromNEHang(); return }
+                } catch {
+                    hostLog.error("keepalive 第 \(round) 轮异常 \(String(describing: error))")
+                    self.applyStatus(nil)
+                }
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
+            }
         }
     }
 
     func startPolling() {
         stopPolling()
         pollTask = Task { @MainActor in
+            var hangCount = 0
             while !Task.isCancelled {
-                let s = try? await ProxyCtl.readStatus()
-                self.applyStatus(s)
+                do {
+                    let s = try await ProxyCtl.readStatus()
+                    self.applyStatus(s)
+                    hangCount = 0
+                } catch is NEWatchdogError {
+                    // 面板打开期连续两次超时（~16s）才重启（首次可能只是系统慢）
+                    hangCount += 1
+                    if hangCount >= 2 {
+                        self.recoverFromNEHang()
+                        return
+                    }
+                } catch {
+                    self.applyStatus(nil)
+                }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
@@ -1204,14 +1390,16 @@ struct ProcessPicker: View {
 
 @main
 struct HostApp {
-    static func main() async {
+    static func main() {
         let allArgs = Array(CommandLine.arguments.dropFirst())
             .filter { $0 != "YES" && $0 != "NO" && !$0.hasPrefix("-NS") && $0 != "-session" }
         // 忽略 Xcode 注入的调试参数(-NSDocumentRevisionsDebugMode YES 等),保留 --include 等 CLI 选项
         // GUI 模式：无参数启动（Finder 双击 / open）→ 菜单栏应用；有参数 → CLI
         if allArgs.isEmpty {
-            await HostApp.runGUI()
-            exit(0)
+            MainActor.assumeIsolated {
+                runGUI()
+            }
+            return
         }
         var cmd = allArgs.first ?? "help"
         // apply 的参数 = 去掉命令词后的剩余项
@@ -1239,7 +1427,43 @@ struct HostApp {
             exit(0)
         }
         do {
-            switch cmd {
+            // 同步 main 桥接 async CLI：Task 跑 async 主体，semaphore 等待。
+            // 关键：CLI 无 runloop，NE completion 投递主队列会饿死——主线程
+            // 在 semaphore 上阻塞时必须同步排水主队列/主 runloop。
+            let done = DispatchSemaphore(value: 0)
+            let box = CLIResultBox()
+            let cmdCopy = cmd
+            let argsCopy = args
+            Task.detached {
+                do {
+                    try await runCLI(cmd: cmdCopy, args: argsCopy)
+                    box.code = 0
+                } catch {
+                    fputs("error: \(error)\n", stderr)
+                    box.code = 1
+                }
+                done.signal()
+            }
+            while done.wait(timeout: .now() + 0.05) == .timedOut {
+                RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            }
+            exit(Int32(box.code))
+        }
+    }
+
+    /// CLI 退出码载体（引用类型，跨并发闭包捕获合法）。
+    private final class CLIResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _code = 0
+        var code: Int {
+            get { lock.lock(); defer { lock.unlock() }; return _code }
+            set { lock.lock(); defer { lock.unlock() }; _code = newValue }
+        }
+    }
+
+    /// CLI 分支的 async 主体（main 同步化后由 Task 承载）。
+    static func runCLI(cmd: String, args: [String]) async throws {
+        switch cmd {
             case "activate":
                 try await SysexInstaller.shared.activate()
                 print("system extension active")
@@ -1291,10 +1515,5 @@ struct HostApp {
                 fputs("unknown command: \(cmd)\n", stderr)
                 exit(2)
             }
-        } catch {
-            fputs("error: \(error)\n", stderr)
-            exit(1)
-        }
-        exit(0)
     }
 }

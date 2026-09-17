@@ -7,7 +7,7 @@ options:
   xcodeVersion: "15.4"
 settings:
   base:
-    DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
+    DEVELOPMENT_TEAM: 3W73W8C23L
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
@@ -19,7 +19,7 @@ targets:
       - path: ../Host/HostApp.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: local.clarity.${DEVELOPMENT_TEAM_LC}
+        PRODUCT_BUNDLE_IDENTIFIER: local.netproxy.3w73w8c23l
         PRODUCT_NAME: NetProxy
         INFOPLIST_FILE: netproxy/Info.plist
         CODE_SIGN_ENTITLEMENTS: netproxy/host.entitlements
@@ -44,8 +44,8 @@ targets:
       - path: ../Sysex/Provider.swift
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: local.clarity.${DEVELOPMENT_TEAM_LC}.extension
-        PRODUCT_NAME: local.clarity.${DEVELOPMENT_TEAM_LC}.extension
+        PRODUCT_BUNDLE_IDENTIFIER: local.netproxy.3w73w8c23l.extension
+        PRODUCT_NAME: local.netproxy.3w73w8c23l.extension
         INFOPLIST_FILE: netproxy/ext-Info.plist
         CODE_SIGN_ENTITLEMENTS: netproxy/ext.entitlements
         MARKETING_VERSION: "1.1"
