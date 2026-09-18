@@ -342,6 +342,50 @@ Debug 构建(同 identifier)再 activate:
 Development 签名的现役扩展。升级流程(§6)中"拷贝 → activate"一步
 前,先确认新构建已公证。
 
+### 坑 22: NEMachServiceName 缺 application-groups 背书 → NESM 崩溃循环(2026-09-18 反汇编定案)⭐️⭐️
+
+给扩展 Info.plist 加 `NEMachServiceName`(XPC 热更通道的 launchd mach
+注册,§9)后,activate 永久卡 `[validating by category]`,且
+**nesessionmanager 每 10s 崩一次**(EXC_BAD_ACCESS / PAC_EXCEPTION 261,
+当天 20+ 份 crash report)。反汇编 nesessionmanager(arm64e 切片,UUID
+与 crash report 吻合)定案:
+
+- 崩溃点在 NESM 校验失败的**错误构造路径**:跳转表按 SYSEXT_* 错误码
+  分发,本例是 `SYSEXT_INVALID_MACH_SERVICE_NAME` 分支;
+- 该分支用 `NEResourcesCopyLocalizedFormatString` 取格式串
+  (`%@ %@ %@ %s`),再 `[[NSString alloc] initWithFormat:]` 拼错误描述,
+  静态引用 `NEMachServiceName` 与 `com.apple.security.application-groups`
+  两个 key 名——**校验内容就是拿 mach 服务名对照扩展声明的 app group**;
+- Apple 自身 bug:错误分支把一个未 PAC 签名的坏指针当 `%@` ObjC 对象
+  传入 → `objc_opt_respondsToSelector` PAC 261 → NESM 死。校验永远
+  完不成,失败记录永久悬空(坑 9 链)。
+
+**判定规则**: `NEMachServiceName` 必须是 `TeamID.扩展bundleID` 形态,
+**且扩展 entitlements 必须声明 `com.apple.security.application-groups`
+覆盖该前缀**(Proxifier 实证:ext 声明宿主 group
+`NXELXU5YLW.com.initex.proxifier.v3.macos`,mach 名
+`NXELXU5YLW.com.initex...Extension` 被其覆盖)。我们加
+`3W73W8C23L.local.netproxy.3w73w8c23l`(TeamID.宿主bundleID)后部署,
+NESM 崩溃立即停止(部署后零新 crash report)。
+
+**注意**: 该 entitlement 加在 ext-devid.entitlements / ext.entitlements
+两份里;Developer ID profile 未列 application-groups 也照常激活(真机
+3.5/27 实证,profile 只背书受限 entitlement,app-group 沙盒声明不走
+profile 覆盖检查)。
+
+### 坑 23: stapler staple 嵌套 sysex 会写坏宿主 seal(2026-09-18)⭐️
+
+`xcrun stapler staple $SYSEX` 往 sysex/Contents/ 写一个票据文件(Apple
+System Integration CA 二进制),而**宿主的 seal 在 codesign 时已封死**
+→ 宿主 `codesign --verify --deep --strict` 报
+`file added: .../CodeResources` → Gatekeeper 判「已损坏」→ exec SIGKILL
+(137)。notarize.sh 曾为修坑 21 的误判(mach 名问题,实为坑 22)加了
+sysex staple,反而引入本坑。
+
+**规则**: **sysex 永远不要 staple**——3.3 与 Proxifier 扩展均无 ticket、
+激活正常(sysextd category 校验走在线公证查询);只 staple 宿主 app
+(写的是宿主自己的 CodeResources,不影响已封的子路径)。
+
 ---
 
 ## 5. 调试方法论(这套问题排查流程可直接复用)
@@ -548,13 +592,13 @@ temporary-exception entitlement),照抄架构:
 ```
 
 - 扩展侧: `Sysex/ConfigXPC.swift` 定义 `ConfigXPCProtocol`
-  (@objc protocol,`pushConfig(_:reply:)`) + `ConfigXPCDelegate`
-  (把 providerConfiguration 字典喂给 Provider.applyConfig——与
-  handleAppMessage 共用同一套解析) + `ConfigXPCService`
-  (NSObject, NSXPCListenerDelegate)。Provider.startProxy 里启动
-  listener,mach 服务名 = 扩展 bundle ID(Info.plist 的
-  `NetworkExtension.NEMachServiceName` 声明同名——launchd system
-  domain 注册由此生效,Proxifier 实证)。
+  (@objc protocol,`pushConfig(_:reply:)`) + `ConfigXPCServer`
+  (NSObject, NSXPCListenerDelegate;把 providerConfiguration 字典喂给
+  Provider 注入的 applyConfig 闭包——与 handleAppMessage 共用同一套
+  解析)。Provider.startProxy 里启动 listener,**mach 服务名 =
+  TeamID + 扩展 bundle ID**(Info.plist 的 `NetworkExtension.NEMachServiceName`
+  声明同名——launchd system domain 注册由此生效,Proxifier 实证;
+  裸 bundle ID 形态会触发坑 22 的 NESM 崩溃,已真机踩过)。
 - 宿主侧: `Host/HostApp.swift` 的 `ConfigXPCClient.push` 同名协议
   客户端。
 - **安全(必做,否则是提权漏洞)**: 扩展是 root 进程,listener 必须
@@ -575,9 +619,16 @@ temporary-exception entitlement),照抄架构:
 
 - `NEMachServiceName` 在 SDK 头文件无文档(0 命中),但 Proxifier 实证
   该键驱动 launchd system domain 注册;`launchctl print system` 的
-  `M` 标志行可见。
+  `M` 标志行可见。**三处必须逐字一致**: Info.plist 键值、
+  ConfigXPCServer.machServiceName、宿主 ConfigXPCClient 的
+  NSXPCConnection machServiceName——任何一处裸 bundle ID 形态都会
+  lookup `No such process`(坑 22 的 invalid 形态)或连不上。
 - 扩展的 NSXPCListener 生命周期: 在 startProxy 里创建并 resume,
   stopProxy 里 invalidate——进程被 NESM 复用时 startProxy 重入,
   listener 幂等重建。
 - 若 mach 连接连不上(扩展刚冷启、listener 未起),落 ②/③ 兜底即可,
   无需等待重试——下次 apply 自然命中。
+- **真机验证(3.5/27, 2026-09-18)**: `start --include-pid <pid>` 输出
+  `✓ hot-reloaded via XPC`,扩展日志(subsystem local.clarity,
+  category extension)`hot-reloaded(xpc): mode=... match=...`,
+  provider pid 全程不变——隧道零重启,规则即时生效。

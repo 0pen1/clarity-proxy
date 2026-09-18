@@ -101,8 +101,9 @@ final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @uncheck
 
 // MARK: - XPC 热更通道（§9，Proxifier 架构复刻）
 
-/// 宿主侧：直连 root 扩展进程的 ConfigXPC listener（mach 服务名 = 扩展
-/// bundle ID，Info.plist NEMachServiceName 声明同名）。公证版上
+/// 宿主侧：直连 root 扩展进程的 ConfigXPC listener（mach 服务名 =
+/// TeamID + 扩展 bundle ID——与扩展 Info.plist NEMachServiceName 逐字
+/// 一致,launchd 按此名注册 mach 服务）。公证版上
 /// sendProviderMessage 被 NESM IPC entitlement 检查整体拒绝（坑 20）——
 /// 本通道不经过 NESM，公证/开发版行为一致。
 /// 协议与 Sysex/ConfigXPC.swift 的 ConfigXPCProtocol 逐字同名。
@@ -118,7 +119,7 @@ enum ConfigXPCClient {
     static func push(_ conf: [String: Any], timeout: TimeInterval = 2) async -> [String: Any]? {
         await withCheckedContinuation { (cont: CheckedContinuation<[String: Any]?, Never>) in
             let done = WDBox()
-            let conn = NSXPCConnection(machServiceName: ProxyCtl.extensionBundleID,
+            let conn = NSXPCConnection(machServiceName: "3W73W8C23L." + ProxyCtl.extensionBundleID,
                                        options: .privileged)
             conn.remoteObjectInterface = NSXPCInterface(with: ConfigXPCProtocol.self)
             // 竞速票：先到者 resume,另一边被 done.claim() 挡掉

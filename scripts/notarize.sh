@@ -12,7 +12,7 @@
 #   1. 从内向外签名（sysex 先签，host 后签——嵌套代码必须内→外）
 #   2. ditto 打包（不能用 zip：会丢符号链接/权限）
 #   3. notarytool submit --wait（失败拉日志）
-#   4. stapler staple + validate + spctl 终验
+#   4. host staple + validate + spctl 终验
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -68,6 +68,12 @@ SUBMIT_OUT=$(xcrun notarytool submit NetProxy.zip -p "$PROFILE" --wait 2>&1) || 
 echo "$SUBMIT_OUT" | tail -5
 grep -q "status: Accepted" <<<"$SUBMIT_OUT" || { echo "✗ 未 Accepted"; exit 1; }
 echo "✓ 公证 Accepted"
+
+# sysex 不 staple：staple 往 sysex/Contents/ 写票据文件，而 host 的 seal
+# 在签名时已封死 → host 校验发现"多出一个文件" → 「已损坏」弹窗 + SIGKILL
+# （3.5/27 实录）。3.3 与 Proxifier 扩展均无 ticket、激活正常——sysextd
+# category 校验走在线公证查询，ticket 并非必要。
+# host staple 放最后（写 host 自己的 CodeResources，不影响已封的子路径）
 
 echo "=== 4. staple + 终验 ==="
 xcrun stapler staple "$APP"

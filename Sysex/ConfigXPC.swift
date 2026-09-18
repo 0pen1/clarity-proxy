@@ -26,9 +26,10 @@ final class ConfigXPCServer: NSObject, NSXPCListenerDelegate {
     private var listener: NSXPCListener?
     private let queue = DispatchQueue(label: "local.clarity.configxpc")
 
-    /// mach 服务名 = 扩展 bundle ID（与 Info.plist NEMachServiceName 一致）。
+    /// mach 服务名 = TeamID.扩展 bundle ID（与 Info.plist NEMachServiceName
+    /// 一致——Proxifier 同款前缀形态；裸 bundle ID 形态曾致 NESM 校验悬挂）。
     static var machServiceName: String {
-        Bundle.main.bundleIdentifier ?? "local.netproxy.3w73w8c23l.extension"
+        "3W73W8C23L." + (Bundle.main.bundleIdentifier ?? "local.netproxy.3w73w8c23l.extension")
     }
 
     /// startProxy 里调用（幂等）。stopProxy 里 invalidate。
