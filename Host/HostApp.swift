@@ -497,6 +497,8 @@ enum ProxyCtl {
         try await manager.saveWD()
         try await manager.loadWD()
         if enable {
+            // 后面 verifyStartProxyLogged 只认此刻之后的 starting: 行。
+            let startWallClock = Date()
             // ---- 防假成功三件套（真机教训：proxy started/status:3 都会骗人）----
             // 1. start 前清场：扩展进程存活且年龄 > 90s（不可能属于本次 start
             //    生命周期）时，NESM 会复用它——新配置不会加载。提示并给出杀进程命令。
@@ -527,6 +529,13 @@ enum ProxyCtl {
                         return
                     }
                     // sendMessage 失败（provider 进程死/旧版本不识别消息）——落回冷启路径。
+                    // 但注意：会话仍 connected 时 NESM 对 startVPNTunnel 是 no-op
+                    // （"Skip a start command: session in state connected"），
+                    // 新配置到不了 provider——后面 verifyStartProxyLogged(since:)
+                    // 会按时间戳判假并报 startProxyMissing（处置指引与僵尸同路径）。
+                    // 公证版 host 的已知形态：devid entitlements 只有 -systemextension
+                    // 后缀值，NESM 的 sendMessage IPC 检查要裸 app-proxy-provider
+                    // → 回执永远丢失 → 必走这里（真机 2026-09-18 定案）。
                     report(.hotReloadFallback)
                 }
             }
@@ -544,8 +553,11 @@ enum ProxyCtl {
 
             // 3. 端到端验证：startProxy 是否真的加载了新配置——看 provider 日志里
             //    本次 start 之后是否出现 "starting:" 行（Logger 需 --info --debug 落盘，
-            //    这里用 subprocess 直接查 log store）。
-            let startingOK = await ProxyCtl.verifyStartProxyLogged()
+            //    这里用 subprocess 直接查 log store）。以本次 start 的时刻为界：
+            //    NESM 复用已连接 provider 时 startVPNTunnel 是 no-op（"Skip a start
+            //    command: session in state connected"），老进程的旧 starting: 行
+            //    仍在 log store 里——只认 start 时间点之后的新行，否则假成功。
+            let startingOK = await ProxyCtl.verifyStartProxyLogged(since: startWallClock)
             if !startingOK {
                 report(.startProxyMissing)
                 return
@@ -619,12 +631,17 @@ enum ProxyCtl {
         return false
     }
 
-    /// 端到端验证：provider 日志在本进程 start 后是否出现 "starting:"（startProxy 执行）。
+    /// 端到端验证：provider 日志在 since 之后是否出现 "starting:"（startProxy 执行）。
     /// 真机教训：status:3 也可能是假成功（老 provider 不重跑 startProxy）。
-    static func verifyStartProxyLogged() async -> Bool {
+    /// 复用进程时老 starting: 行仍在 log store——必须按时间戳过滤（--start 时刻
+    /// 之后的行才算数），否则热更 fallback 后的复用 no-op 也报成功。
+    static func verifyStartProxyLogged(since: Date) async -> Bool {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        let sinceStr = fmt.string(from: since)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
-        proc.arguments = ["show", "--last", "1m", "--info", "--debug",
+        proc.arguments = ["show", "--start", sinceStr, "--info", "--debug",
                           "--predicate", "category == \"extension\" AND (subsystem == \"local.clarity\" OR subsystem == \"local.netproxy\")",
                           "--style", "compact"]
         let pipe = Pipe()
