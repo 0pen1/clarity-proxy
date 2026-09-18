@@ -129,6 +129,7 @@ enum ApplyEvent {
     case hotReloadFallback                 // sendMessage 未获回执，落回重启隧道路径
     case staleProvider(pid: Int32, etime: String)  // 扩展进程早于本次 start，NESM 将复用
     case waitTimeout                       // 15s 内未 connected（僵尸 provider 特征）
+    case stopTimeout                       // stopVPNTunnel 后 10s 未 disconnected
     case startProxyMissing                 // connected 但 startProxy 未执行（僵尸特征）
     case started(pids: [Int], include: [String], tree: Bool, argInclude: [String])
     case stopped
@@ -340,6 +341,11 @@ enum ProxyCtl {
                 print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
                 print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
                 print("   诊断: /usr/bin/log show --last 2m --info --debug --predicate 'process == \"nesessionmanager\" AND eventMessage CONTAINS \"NetProxy\"'")
+            case .stopTimeout:
+                print("⚠️  stop 后 10s 未 disconnected——NESM 状态机卡死，本次 start 放弃：")
+                print("   1) 重试一次 $APP 命令")
+                print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
+                print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
             case .startProxyMissing:
                 print("⚠️  connected 但 provider 未执行 startProxy（配置未加载）——")
                 print("   NESM 复用了旧 provider 进程。处置同上：pkill 后重试，或重启 Mac。")
@@ -528,15 +534,18 @@ enum ProxyCtl {
                                             include: mergedInclude, tree: effTreeMode))
                         return
                     }
-                    // sendMessage 失败（provider 进程死/旧版本不识别消息）——落回冷启路径。
-                    // 但注意：会话仍 connected 时 NESM 对 startVPNTunnel 是 no-op
-                    // （"Skip a start command: session in state connected"），
-                    // 新配置到不了 provider——后面 verifyStartProxyLogged(since:)
-                    // 会按时间戳判假并报 startProxyMissing（处置指引与僵尸同路径）。
-                    // 公证版 host 的已知形态：devid entitlements 只有 -systemextension
+                    // sendMessage 失败（provider 进程死/旧版本不识别消息/公证版 IPC
+                    // entitlement 被 NESM 拒——devid entitlements 只有 -systemextension
                     // 后缀值，NESM 的 sendMessage IPC 检查要裸 app-proxy-provider
-                    // → 回执永远丢失 → 必走这里（真机 2026-09-18 定案）。
+                    // → 回执永远丢失，真机 2026-09-18 定案）——落回冷启路径。
+                    // 关键：会话仍 connected 时 NESM 对 startVPNTunnel 是 no-op
+                    // （"Skip a start command: session in state connected"），新配置
+                    // 到不了 provider——必须先停隧道再启。真机事故：GUI 加 pid →
+                    // 热更被拒 → fallback skip → 状态 forever「连接中…」。
                     report(.hotReloadFallback)
+                    if !(await ProxyCtl.stopTunnelAndWait(manager: manager, report: report)) {
+                        return // NESM 状态机卡死，本次 start 放弃（僵尸处置路径已上报）
+                    }
                 }
             }
 
@@ -550,7 +559,6 @@ enum ProxyCtl {
                 report(.waitTimeout)
                 return
             }
-
             // 3. 端到端验证：startProxy 是否真的加载了新配置——看 provider 日志里
             //    本次 start 之后是否出现 "starting:" 行（Logger 需 --info --debug 落盘，
             //    这里用 subprocess 直接查 log store）。以本次 start 的时刻为界：
@@ -567,6 +575,33 @@ enum ProxyCtl {
         } else {
             report(.stopped)
         }
+    }
+
+    /// 停隧道并等 disconnected。热更 fallback 路径专用：会话 connected 时
+    /// startVPNTunnel 被 NESM skip（no-op），必须先 stop 把状态机带回 idle/disconnected
+    /// 再 start，新配置才会作为新的 start command 下发。10s 未断开 → stopTimeout
+    /// （NESM 卡死，同僵尸处置路径）并返回 false，调用方应放弃本次 start。
+    /// 状态经 loadAllWD 重查（与 waitConnected 同型）：进程内 connection.status
+    /// 不一定实时刷新，重载的 manager 携带 NESM 侧权威状态。
+    @discardableResult
+    static func stopTunnelAndWait(manager: NETransparentProxyManager,
+                                  report: @escaping (ApplyEvent) -> Void) async -> Bool {
+        manager.connection.stopVPNTunnel()
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            if let m = (try? await NETransparentProxyManager.loadAllWD())?.first(where: {
+                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+                    == ProxyCtl.extensionBundleID
+            }) {
+                let st = m.connection.status
+                if st == .disconnected || st == .invalid { return true }
+            } else {
+                return true // 配置已不存在——视为已停
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        report(.stopTimeout)
+        return false
     }
 
     /// 扩展进程年龄检查：进程启动时间早于 90 秒前 = 它不属于本次 start，
@@ -1093,7 +1128,7 @@ final class AppState: ObservableObject {
             toast = "⚠️ 热更未获回执——已回退重启隧道"
         case .staleProvider(let pid, let etime):
             toast = "⚠️ 检测到旧扩展进程 pid \(pid)（存活 \(etime)），建议 sudo kill -9 \(pid)"
-        case .waitTimeout, .startProxyMissing:
+        case .waitTimeout, .startProxyMissing, .stopTimeout:
             toast = "⚠️ 僵尸 provider 特征——停止后重试，或 sudo pkill -9 -f local.netproxy"
         case .started(let pids, _, _, _):
             toast = "✓ 启动成功（监控 pid: \(pids)）"
