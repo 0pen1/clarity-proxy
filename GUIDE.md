@@ -309,6 +309,39 @@ macOS 14.4 上疑似与 NEProvider 的 ObjC 派发不兼容(曾表现为 Plugin 
 `handleAppMessage(_:completionHandler:)`(参数类型 `((Data?) -> Void)?`,
 注意 optional)。
 
+### 坑 20: 公证版 sendProviderMessage 热更通道被 NESM 整体拒绝(2026-09-18 定案)⭐️⭐️
+
+`NETunnelProviderSession.sendProviderMessage` 在公证版 host 上**永远失败**:
+NESM 对每条 sendMessage IPC 做 entitlement 检查,要求调用方持有**裸值**
+`app-proxy-provider`;而 Developer ID profile 只允许**带后缀值**
+`app-proxy-provider-systemextension`(见 §3.1 的分布类型绑定)。错误日志:
+
+```
+nesessionmanager: process <pid> is not entitled to establish IPC with
+plugins of type <ext-bundle-id>
+```
+
+- 本机 3 天日志 20 条该拒绝**全部**来自 NetProxy;同机的 Proxifier
+  (同样只有后缀值 entitlements)零条——因为它根本不走这个通道(见 §9)。
+- Development 签名的 host(裸值 entitlements)不受影响——这也是开发期
+  "sendMessage 偶尔能用"的错觉来源。
+- **结论: 公证版规则热更必须绕开 NE IPC**(§9 的 XPC 直连方案),
+  sendMessage 热更只对 Development 签名构建有效,留作开发期通道。
+
+### 坑 21: 公证版 ↔ Development 版不能互相替换(真机 2026-09-18)⭐️
+
+现役扩展是 Developer ID 公证版时,直接部署 Apple Development 签名的
+Debug 构建(同 identifier)再 activate:
+- 不报错也不拒绝——**永远卡 `[validating by category]`**(sysextd 反复
+  `Error checking with notarization daemon: 3`,每 10s 重试);
+- 此次失败留下一条悬空 validating 记录 → 坑 9 双记录 → 后续一切
+  activate(包括换回公证版)Code=4,**重启 Mac 唯一解**。
+
+**规则**: 替换已公证扩展的构建**必须同样走 notarize.sh 公证**(签名
+身份一致,category 校验走票据,秒过);Development 签名构建只能替换
+Development 签名的现役扩展。升级流程(§6)中"拷贝 → activate"一步
+前,先确认新构建已公证。
+
 ---
 
 ## 5. 调试方法论(这套问题排查流程可直接复用)
@@ -404,12 +437,13 @@ $APP/Contents/MacOS/NetProxy discover
   --predicate 'subsystem == "local.netproxy" AND category == "extension"'
 ```
 
-升级扩展版本流程(重要,避免坑 9):
+升级扩展版本流程(重要,避免坑 9/21):
 ```bash
 # 1. 改代码 → 改 ext-Info.plist 版本号 → xcodebuild
-# 2. 部署到 /Applications
-# 3. stop 隧道 → 等 5 秒 → activate → 等 5 秒 → start
-# 4. 若激活 Code=4/卡 validating → 重启后重试(只做一次)
+# 2. ./scripts/notarize.sh(现役是公证版时,替换构建必须同样公证——坑 21)
+# 3. 部署到 /Applications
+# 4. stop 隧道 → 等 5 秒 → activate → 等 5 秒 → start
+# 5. 若激活 Code=4/卡 validating → 重启后重试(只做一次)
 ```
 
 ---
@@ -451,3 +485,99 @@ $APP/Contents/MacOS/NetProxy discover
     validating = NE 侧问题
   - NETransparentProxyProvider 系列(handleNewFlow 返回 false = 系统放行)
 - 本机实测对照样本: Proxifier.app(sysex 结构/entitlements/profile 逐项比对)。
+
+---
+
+## 9. 热更新架构: Proxifier 解剖与 XPC 直连方案(2026-09-18 实录)⭐️
+
+### 9.1 问题: 为什么公证版改规则要么不生效、要么要把隧道推倒重来
+
+NE 官方给 host → provider 的运行时通道只有一条:
+`NETunnelProviderSession.sendProviderMessage` → provider 的
+`handleAppMessage`。这条通道在公证版上被 NESM 的 IPC entitlement 检查
+整体拒绝(坑 20),于是每次改规则都只能走"停隧道 → startVPNTunnel"的
+冷启路径——而 NESM 状态机(坑 17 僵尸 provider、stop/start 竞态)和
+内核 flow-divert 控制 socket 耗尽(reboot 唯一解)都在这条路径上等着。
+
+### 9.2 Proxifier 为什么从不重启: 证据链(全部本机实测)
+
+同机安装的 Proxifier 3.15(Developer ID + 公证,entitlements 带后缀值,
+与 NetProxy 同款限制)改规则秒生效、隧道 3 天零次重启、扩展进程
+(root)开机起活到关机。解剖结论:**它根本不走 NE IPC,规则热更走
+自建 XPC 直连**。证据:
+
+1. **NESM 日志对照**(最硬): 3 天 `nesessionmanager` 日志里
+   `not entitled to establish IPC` 拒绝 20 条全是 NetProxy,Proxifier
+   零条——若它走 sendMessage 必被同样拒绝。且 `Proxifier Data`
+   (透明代理会话)3 天内零次 start/stop 命令。
+2. **双方二进制都有自建 XPC 栈**:
+   - 扩展: `XPCServerInExtension.swift`、`Starting XPC listener for
+     mach service %@` 格式串、`IPCExtension`/`IPCBaseProtcol` 协议;
+     运行时每次开机打一行 `Starting XPC listener for mach service <private>`。
+   - 宿主: `XPCClientForExtension.swift`,方法表即热更协议——
+     `helloWithVersion:reply:`(握手)、
+     **`updateSettingWithSettings:profile:reply:`**(推送整份 profile:
+     dump 出的 CProfileEx 结构含 m_Proxies/m_Chains/**m_Rules**/m_Options)、
+     `retriveTickDataWithReply:`(反向拉状态)。
+3. **mach 通道基础设施**: 扩展 Info.plist 声明
+   `NEMachServiceName = NXELXU5YLW.com.initex.proxifier.v3.macos.ProxifierExtension`,
+   `launchctl print system` 里该 mach 服务真实注册在 system domain;
+   宿主持有 `temporary-exception.mach-register.global-name`
+   (沙箱宿主自建反向 XPC 服务端,供扩展连回——双向 XPC)。
+4. **排除其他通道**: App Group 容器存在但全空(非文件共享);
+   无 LaunchDaemon、无 PrivilegedHelperTools、无 /tmp socket。
+
+**为什么它永远不用重启**: 不改 providerConfiguration 就不碰
+saveToPreferences/startVPNTunnel(NESM skip no-op 不可达)、不 stop/start
+隧道(NESM 状态机竞态不可达)、不 deactivate/activate(坑 17 不可达)、
+扩展进程每开机只 spawn 一次(flow-divert 控制 socket 耗尽不可达)。
+规则变更 = 一条 XPC 消息,root 扩展进程内就地生效。
+
+### 9.3 落地: clarity-proxy 的 ConfigXPC 通道(3.5 实现)
+
+NetProxy 宿主**无沙箱**(比 Proxifier 条件更好,不需要
+temporary-exception entitlement),照抄架构:
+
+```
+宿主 apply() 热更快路径:
+  ① ConfigXPC.push(conf) — NSXPCConnection(machServiceName: ext 的
+     NEMachServiceName, options: .privileged) 直连 root 扩展进程,
+     2s 超时竞速 → 命中即热更完成,结束。
+  ② 失败 → sendProviderMessage(Development 签名构建的有效通道)。
+  ③ 再失败 → 冷启(stopTunnelAndWait → startVPNTunnel,兜底)。
+```
+
+- 扩展侧: `Sysex/ConfigXPC.swift` 定义 `ConfigXPCProtocol`
+  (@objc protocol,`pushConfig(_:reply:)`) + `ConfigXPCDelegate`
+  (把 providerConfiguration 字典喂给 Provider.applyConfig——与
+  handleAppMessage 共用同一套解析) + `ConfigXPCService`
+  (NSObject, NSXPCListenerDelegate)。Provider.startProxy 里启动
+  listener,mach 服务名 = 扩展 bundle ID(Info.plist 的
+  `NetworkExtension.NEMachServiceName` 声明同名——launchd system
+  domain 注册由此生效,Proxifier 实证)。
+- 宿主侧: `Host/HostApp.swift` 的 `ConfigXPCClient.push` 同名协议
+  客户端。
+- **安全(必做,否则是提权漏洞)**: 扩展是 root 进程,listener 必须
+  校验连接方——`NSXPCConnection` 的 `auditToken`(private API 形态:
+  `extension NSXPCConnection { var auditToken: audit_token_t }`),
+  `audit_token_to_pid` + `proc_pidpath` 校验路径 = 本 app 的
+  `/Applications/NetProxy.app/Contents/MacOS/NetProxy`。Proxifier 同样
+  这么做(其扩展有 audit token 校验类符号)。注: 签名校验
+  `SecCodeCopyGuestWithAttributes` 需要 audit token → SecCode,
+  sandbox 扩展内可用;进程路径校验对"替换二进制"攻击面足够(替换
+  /Applications 下二进制本身需要管理员权限)。
+- 消息内容: 与 handleAppMessage 相同的全量 providerConfiguration 字典
+  (JSON/plist 序列化),扩展侧 `applyConfig` 就地生效。**持久化仍由宿主
+  saveToPreferences 负责**(冷启时 startProxy 从 providerConfiguration 读)
+  ——XPC 热更只改内存,与 NE 通道的语义分工不变。
+
+### 9.4 实测注意
+
+- `NEMachServiceName` 在 SDK 头文件无文档(0 命中),但 Proxifier 实证
+  该键驱动 launchd system domain 注册;`launchctl print system` 的
+  `M` 标志行可见。
+- 扩展的 NSXPCListener 生命周期: 在 startProxy 里创建并 resume,
+  stopProxy 里 invalidate——进程被 NESM 复用时 startProxy 重入,
+  listener 幂等重建。
+- 若 mach 连接连不上(扩展刚冷启、listener 未起),落 ②/③ 兜底即可,
+  无需等待重试——下次 apply 自然命中。

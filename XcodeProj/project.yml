@@ -42,6 +42,7 @@ targets:
       - path: ../Sysex/main.swift
       - path: ../Sysex/UDPFlow.swift
       - path: ../Sysex/Provider.swift
+      - path: ../Sysex/ConfigXPC.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.netproxy.3w73w8c23l.extension

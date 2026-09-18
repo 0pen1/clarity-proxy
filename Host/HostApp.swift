@@ -99,6 +99,58 @@ final class SysexInstaller: NSObject, OSSystemExtensionRequestDelegate, @uncheck
     }
 }
 
+// MARK: - XPC 热更通道（§9，Proxifier 架构复刻）
+
+/// 宿主侧：直连 root 扩展进程的 ConfigXPC listener（mach 服务名 = 扩展
+/// bundle ID，Info.plist NEMachServiceName 声明同名）。公证版上
+/// sendProviderMessage 被 NESM IPC entitlement 检查整体拒绝（坑 20）——
+/// 本通道不经过 NESM，公证/开发版行为一致。
+/// 协议与 Sysex/ConfigXPC.swift 的 ConfigXPCProtocol 逐字同名。
+@objc protocol ConfigXPCProtocol {
+    @objc func pushConfig(_ conf: [String: Any], withReply reply: @escaping ([String: Any]) -> Void)
+}
+
+enum ConfigXPCClient {
+    /// 推送全量配置。2s 超时竞速（NSXPCConnection 无内建超时;reply 走
+    /// libdispatch 竞速,超时后连接 invalidate——扩展侧 applyConfig 若迟到
+    /// 会照常生效,宿主只当失败落兜底,重复推送幂等无害）。
+    /// 返回 ack 字典或 nil（连不上/超时/reply 非字典）。
+    static func push(_ conf: [String: Any], timeout: TimeInterval = 2) async -> [String: Any]? {
+        await withCheckedContinuation { (cont: CheckedContinuation<[String: Any]?, Never>) in
+            let done = WDBox()
+            let conn = NSXPCConnection(machServiceName: ProxyCtl.extensionBundleID,
+                                       options: .privileged)
+            conn.remoteObjectInterface = NSXPCInterface(with: ConfigXPCProtocol.self)
+            // 竞速票：先到者 resume,另一边被 done.claim() 挡掉
+            let wdQueue = DispatchQueue(label: "local.clarity.configxpc.host")
+            wdQueue.asyncAfter(deadline: .now() + timeout) {
+                if done.claim() { return }
+                hostLog.error("ConfigXPC: push timeout \(timeout)s")
+                cont.resume(returning: nil)
+                conn.invalidate()
+            }
+            let proxy = conn.remoteObjectProxyWithErrorHandler { err in
+                if done.claim() { return }
+                hostLog.error("ConfigXPC: push error \(err, privacy: .public)")
+                cont.resume(returning: nil)
+                conn.invalidate()
+            } as? ConfigXPCProtocol
+            guard let proxy else {
+                if done.claim() { return }
+                cont.resume(returning: nil)
+                conn.invalidate()
+                return
+            }
+            proxy.pushConfig(conf) { ack in
+                if done.claim() { return }
+                cont.resume(returning: ack as? [String: Any])
+                conn.invalidate()
+            }
+            conn.resume()
+        }
+    }
+}
+
 // MARK: - 类型化配置（CLI 与 GUI 共用）
 
 /// 一次配置变更的增量描述，与 CLI 参数语义一一对应：
@@ -127,6 +179,7 @@ enum ApplyEvent {
     case missingPid(Int)                   // pid 不存在，警告
     case hotReloaded(match: String, pids: [Int], include: [String], tree: Bool)
     case hotReloadFallback                 // sendMessage 未获回执，落回重启隧道路径
+    case hotReloadXPC                      // ConfigXPC 直连命中（公证版主通道）
     case staleProvider(pid: Int32, etime: String)  // 扩展进程早于本次 start，NESM 将复用
     case waitTimeout                       // 15s 内未 connected（僵尸 provider 特征）
     case stopTimeout                       // stopVPNTunnel 后 10s 未 disconnected
@@ -329,6 +382,8 @@ enum ProxyCtl {
             case .hotReloaded(let match, let pids, let include, let tree):
                 print("✓ hot-reloaded (match: \(match)) — provider 未重启，规则即时生效")
                 print("  (pids=\(pids) include=\(include) tree=\(tree))")
+            case .hotReloadXPC:
+                print("✓ hot-reloaded via XPC (match 见扩展日志) — provider 未重启，规则即时生效")
             case .hotReloadFallback:
                 print("⚠️  sendMessage 热更未获回执——回退到重启隧道路径")
             case .staleProvider(let pid, let etime):
@@ -508,44 +563,55 @@ enum ProxyCtl {
             // ---- 防假成功三件套（真机教训：proxy started/status:3 都会骗人）----
             // 1. start 前清场：扩展进程存活且年龄 > 90s（不可能属于本次 start
             //    生命周期）时，NESM 会复用它——新配置不会加载。提示并给出杀进程命令。
-            // ---- 热更新快路径：provider 已 connected 时 sendMessage 推全量新配置，
-            // 不重启隧道、不碰 NESM 状态机——绕开"加 pid 必须 sudo kill 扩展进程"
-            // 的循环（真机两天 5 次事故的根治）。冷启（未连接）才走 startVPNTunnel。
-            if manager.connection.status == .connected,
-               let session = manager.connection as? NETunnelProviderSession {
-                let msg: [String: Any] = ["type": "config", "config": conf]
-                if let data = try? JSONSerialization.data(withJSONObject: msg, options: []) {
-                    // completion 版包装为 async（async 重载与 completion 版签名有歧义）。
-                    let ackData: Data? = await withCheckedContinuation { cont in
-                        do {
-                            try session.sendProviderMessage(data) { resp in
-                                cont.resume(returning: resp)
+            // ---- 热更新快路径：provider 已 connected 时推送全量新配置，
+            // 不重启隧道、不碰 NESM 状态机。通道优先级（§9）：
+            // ① ConfigXPC 直连（mach 连 root 扩展进程,不过 NESM——公证版
+            //    主通道,坑 20 的 sendMessage 拒绝不可达）
+            // ② sendProviderMessage（Development 签名构建有效;公证版被拒）
+            // ③ 冷启兜底（stop → start）
+            if manager.connection.status == .connected {
+                // ① XPC 直连：扩展 listener 在 startProxy 里启动,冷启后首次
+                //    apply 时已就绪;连不上（扩展刚死/旧版扩展无此通道）→ nil,落 ②。
+                if let ack = await ConfigXPCClient.push(conf),
+                   ack["ok"] as? Bool == true {
+                    report(.hotReloadXPC)
+                    return
+                }
+                if let session = manager.connection as? NETunnelProviderSession {
+                    let msg: [String: Any] = ["type": "config", "config": conf]
+                    if let data = try? JSONSerialization.data(withJSONObject: msg, options: []) {
+                        // completion 版包装为 async（async 重载与 completion 版签名有歧义）。
+                        let ackData: Data? = await withCheckedContinuation { cont in
+                            do {
+                                try session.sendProviderMessage(data) { resp in
+                                    cont.resume(returning: resp)
+                                }
+                            } catch {
+                                cont.resume(returning: nil)
                             }
-                        } catch {
-                            cont.resume(returning: nil)
+                        }
+                        if let ack = ackData,
+                           let ackObj = try? JSONSerialization.jsonObject(with: ack, options: []),
+                           let ackDict = ackObj as? [String: Any],
+                           ackDict["ok"] as? Bool == true {
+                            let matchDesc = "\(ackDict["match"] ?? "?")"
+                            report(.hotReloaded(match: matchDesc, pids: mergedPids,
+                                                include: mergedInclude, tree: effTreeMode))
+                            return
                         }
                     }
-                    if let ack = ackData,
-                       let ackObj = try? JSONSerialization.jsonObject(with: ack, options: []),
-                       let ackDict = ackObj as? [String: Any],
-                       ackDict["ok"] as? Bool == true {
-                        let matchDesc = "\(ackDict["match"] ?? "?")"
-                        report(.hotReloaded(match: matchDesc, pids: mergedPids,
-                                            include: mergedInclude, tree: effTreeMode))
-                        return
-                    }
-                    // sendMessage 失败（provider 进程死/旧版本不识别消息/公证版 IPC
-                    // entitlement 被 NESM 拒——devid entitlements 只有 -systemextension
-                    // 后缀值，NESM 的 sendMessage IPC 检查要裸 app-proxy-provider
-                    // → 回执永远丢失，真机 2026-09-18 定案）——落回冷启路径。
-                    // 关键：会话仍 connected 时 NESM 对 startVPNTunnel 是 no-op
-                    // （"Skip a start command: session in state connected"），新配置
-                    // 到不了 provider——必须先停隧道再启。真机事故：GUI 加 pid →
-                    // 热更被拒 → fallback skip → 状态 forever「连接中…」。
-                    report(.hotReloadFallback)
-                    if !(await ProxyCtl.stopTunnelAndWait(manager: manager, report: report)) {
-                        return // NESM 状态机卡死，本次 start 放弃（僵尸处置路径已上报）
-                    }
+                }
+                // ② 失败（provider 进程死/旧版本不识别消息/公证版 IPC
+                // entitlement 被 NESM 拒——devid entitlements 只有 -systemextension
+                // 后缀值，NESM 的 sendMessage IPC 检查要裸 app-proxy-provider
+                // → 回执永远丢失，真机 2026-09-18 定案）——落回冷启路径。
+                // 关键：会话仍 connected 时 NESM 对 startVPNTunnel 是 no-op
+                // （"Skip a start command: session in state connected"），新配置
+                // 到不了 provider——必须先停隧道再启。真机事故：GUI 加 pid →
+                // 热更被拒 → fallback skip → 状态 forever「连接中…」。
+                report(.hotReloadFallback)
+                if !(await ProxyCtl.stopTunnelAndWait(manager: manager, report: report)) {
+                    return // NESM 状态机卡死，本次 start 放弃（僵尸处置路径已上报）
                 }
             }
 
@@ -1124,6 +1190,8 @@ final class AppState: ObservableObject {
         switch event {
         case .hotReloaded(let match, _, _, _):
             toast = "✓ 已即时生效（热更）：\(match)"
+        case .hotReloadXPC:
+            toast = "✓ 已即时生效（XPC 热更）"
         case .hotReloadFallback:
             toast = "⚠️ 热更未获回执——已回退重启隧道"
         case .staleProvider(let pid, let etime):

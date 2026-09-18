@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.5 (2026-09-18)
+
+- **XPC 热更通道（公证版根治）**：解剖同机 Proxifier 3.15 实证其规则热更不走 NE IPC（3 天 NESM 日志零拒绝、Data 隧道零重启），而是宿主 ↔ root 扩展进程自建 NSXPC 直连（扩展 Info.plist `NEMachServiceName` + 双端自建 XPC 栈 `XPCClientForExtension`/`XPCServerInExtension`，方法表 `updateSettingWithSettings:profile:reply:`）。NetProxy 照抄架构：扩展侧 `ConfigXPC.swift`（listener = 扩展 bundle ID，proc_pidpath 校验连接方防 root 提权），宿主侧 `ConfigXPCClient.push`（2s 超时竞速）。apply() 热更链重排：① XPC 直连（公证版主通道）→ ② sendMessage（Development 有效）→ ③ 冷启兜底。详见 GUIDE §9 / 坑 20。
+- **坑 21（GUIDE）**：公证版现役扩展不能被 Development 签名构建替换——卡 validating（notarization daemon: 3）+ 双记录 Code=4，重启唯一解。替换已公证扩展必须同样公证。
+- 真机状态：3.5 公证版已就绪待激活（本机需重启清坑 21 双记录后 activate）。
+
 ## 3.4 (2026-09-18)
 
 - **热更 fallback 假成功根治**：公证版 host 的 sendMessage IPC entitlement 被 NESM 拒（devid entitlements 只有 `-systemextension` 后缀值，NESM 检查要裸 `app-proxy-provider`），fallback 落回冷启时若会话仍 connected，`startVPNTunnel` 被 NESM skip（no-op）→ 新配置永远到不了 provider，GUI 卡「连接中…」。现在 fallback 先 `stopVPNTunnel` 并等 disconnected（10s 超时上报 stopTimeout）再 start。真机事故：GUI 加 pid → 热更被拒 → fallback skip → forever「连接中…」。

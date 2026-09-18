@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>SYSX</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.3</string>
+	<string>3.5</string>
 	<key>CFBundleVersion</key>
-	<string>24</string>
+	<string>25</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSAppTransportSecurity</key>
@@ -33,6 +33,10 @@
 	<string>NetProxy needs to intercept outbound traffic of selected processes to forward it to its upstream proxy.</string>
 	<key>NetworkExtension</key>
 	<dict>
+		<!-- mach 服务名 = 扩展 bundle ID（§9 ConfigXPC 热更通道;
+		     Proxifier 实证该键驱动 launchd system domain 注册） -->
+		<key>NEMachServiceName</key>
+		<string>local.netproxy.3w73w8c23l.extension</string>
 		<key>NEProviderClasses</key>
 		<dict>
 			<key>com.apple.networkextension.app-proxy</key>

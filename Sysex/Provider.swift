@@ -497,10 +497,35 @@ class Provider: BaseProvider {
     fileprivate func selfBridges_add(_ b: TCPBridge) { addBridge(b) }
     fileprivate func selfBridges_remove(_ b: TCPBridge) { removeBridge(b) }
 
+    // ConfigXPC 闭包用的只读访问器（filter/状态是 private,ConfigXPC.swift
+    // 的回执构造需要它们;fileinternal 隔离在同 target 内）
+    fileprivate var filterIncludePids: [UInt32] { filter.includePids }
+    fileprivate var filterTreeMode: Bool { filter.treeMode }
+    fileprivate var filterIncludePaths: [String] { filter.includePaths }
+    fileprivate var upstreamModeStr: String { upstreamMode }
+
     override func startProxy(options: [String: Any]? = nil) async throws {
         if let conf = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration {
             applyConfig(conf)
         }
+        // XPC 热更通道（§9）：listener 幂等启动；NESM 复用进程重入 startProxy
+        // 时重建。处理闭包指向 applyConfig + 回执构造（与 handleAppMessage 同构）。
+        ConfigXPCServer.shared.applyConfig = { [weak self] conf in
+            guard let self else { return ["ok": false, "error": "provider gone"] }
+            self.applyConfig(conf)
+            let modeDesc: String
+            if !self.filterIncludePids.isEmpty { modeDesc = "pid:\(self.filterIncludePids)" }
+            else if self.filterTreeMode { modeDesc = "tree" }
+            else { modeDesc = "flat" }
+            log.info("hot-reloaded(xpc): mode=\(self.upstreamModeStr, privacy: .public) match=\(modeDesc, privacy: .public)")
+            return [
+                "ok": true,
+                "match": modeDesc,
+                "includePids": self.filterIncludePids.map { Int($0) },
+                "includePaths": self.filterIncludePaths,
+            ]
+        }
+        ConfigXPCServer.shared.start()
         let modeDesc: String
         if !filter.includePids.isEmpty { modeDesc = "pid:\(filter.includePids)" }
         else if filter.treeMode { modeDesc = "tree" }
@@ -585,6 +610,7 @@ class Provider: BaseProvider {
 
     override func stopProxy(with reason: NEProviderStopReason) async {
         log.info("stopProxy reason=\(reason.rawValue)")
+        ConfigXPCServer.shared.stop()
     }
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
