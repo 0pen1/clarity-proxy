@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.6.1 (2026-09-20)
+
+- **宿主版本号同步发版节奏**：release.sh bump 步骤同时更新宿主与扩展两个 Info.plist（此前只 bump ext——宿主 GUI 头一直显示 v1.1）。仓库现状一次性对齐 3.6.1（Info.plist / project.yml / pbxproj）。
+- **cask 去 sudo 化**：tap `Casks/netproxy.rb` 拿掉 `uninstall delete: db.plist`——升级不再需要 sudo（NESM 登记归系统管，brew 不该碰）。release.sh tap 环节先 `pull --rebase` 再最小替换（只动 version/sha 两行），防覆盖远端 cask 结构。
+
 ## 3.6 (2026-09-20)
 
 - **冷启自动重试（开机竞态自愈）**：apply() 冷启路径改两轮制——首轮 startVPNTunnel→waitConnected(15s) 失败后自动 stop→start 重试一轮（会话 connected 时 NESM 对 startVPNTunnel 是 skip no-op，先停才有效；stop 卡死则直接放弃）。开机竞态下 NESM 自动拉起失败后状态机滞后，首轮 15s 超时是常态（真机 2026-09-19 开机实录），不重试会误报「僵尸 provider」。两轮都失败才上报 waitTimeout/startProxyMissing/stopTimeout，文案从「僵尸 provider」改口「NESM 状态机卡死」（GUI 建议重启 Mac）。新增 ApplyEvent.coldStartRetry，CLI/GUI 双端同步。
