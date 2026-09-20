@@ -78,21 +78,34 @@ if [ ! -d "$TAP_DIR/.git" ]; then
   echo "    git clone https://github.com/0pen1/homebrew-tap ~/Desktop/homebrew-tap"
   exit 1
 fi
+# 先与远端对齐再改 cask（真机 2026-09-20 事故：本地落后远端时 push 被拒，
+# 且本地旧 cask 整文件正则重写会冲掉远端的结构性改进——depends_on/
+# url 插值/caveats 全丢，手工 rebase 才救回）。
+if ! ( cd "$TAP_DIR" && git fetch origin && git pull --rebase -q origin main ); then
+  echo "  ✗ tap 仓库与远端冲突——手动处理 $TAP_DIR 后重跑"
+  exit 1
+fi
 CASK="$TAP_DIR/Casks/netproxy.rb"
+# 以当前（已对齐远端的）cask 做最小替换：只动 version/sha256 两行。
+# URL 不动——cask 已用 #{version} 插值（v3.3 定案），version 变更自然跟随。
 python3 - "$CASK" "$VER" "$SHA" <<'PYEOF'
 import re, sys
 path, ver, sha = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(path).read()
-s = re.sub(r'version "[^"]+"', f'version "{ver}"', s)
-s = re.sub(r'sha256 "[a-f0-9]+"', f'sha256 "{sha}"', s)
-s = re.sub(r'url "[^"]+NetProxy-v[^"]+\.zip"',
-           f'url "https://github.com/0pen1/clarity-proxy/releases/download/v{ver}/NetProxy-v{ver}.zip"', s)
+if 'version "#{version}"' not in s:
+    # 旧形态：URL 写死版本号——升级为 #{version} 插值（否则永远发不出新版本）
+    s = re.sub(r'url "[^"]+NetProxy-v[^"]+\.zip"',
+               'url "https://github.com/0pen1/clarity-proxy/releases/download/v#{version}/NetProxy-v#{version}.zip"',
+               s)
+s = re.sub(r'version "[^"]+"', f'version "{ver}"', s, count=1)
+s = re.sub(r'sha256 "[a-f0-9]+"', f'sha256 "{sha}"', s, count=1)
 open(path, 'w').write(s)
 print(f"  cask 已更新: version={ver} sha256={sha[:12]}...")
 PYEOF
-( cd "$TAP_DIR" && git add -A && git commit -q -m "netproxy $VER" && git push -q )
+( cd "$TAP_DIR" && git add -A && git commit -q -m "netproxy $VER" && git push -q origin main )
 
-# commit 本仓库的版本号 bump
+# commit 本仓库的版本号 bump（rebase 对齐远端——与 tap 同款防覆盖）
+git pull --rebase -q origin main 2>/dev/null || true
 git add XcodeProj/netproxy/ext-Info.plist
 git commit -q -m "release: v$VER (build $BUILD)" || true
 git push -q 2>/dev/null || git push
