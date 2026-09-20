@@ -23,8 +23,8 @@ targets:
         PRODUCT_NAME: NetProxy
         INFOPLIST_FILE: netproxy/Info.plist
         CODE_SIGN_ENTITLEMENTS: netproxy/host.entitlements
-        MARKETING_VERSION: "1.1"
-        CURRENT_PROJECT_VERSION: "1.1"
+        MARKETING_VERSION: "3.6"
+        CURRENT_PROJECT_VERSION: "2609201017"
         # CLI 型 host:LSUIElement 无窗口
         LSUIElement: true
     dependencies:
@@ -49,8 +49,8 @@ targets:
         PRODUCT_NAME: local.netproxy.3w73w8c23l.extension
         INFOPLIST_FILE: netproxy/ext-Info.plist
         CODE_SIGN_ENTITLEMENTS: netproxy/ext.entitlements
-        MARKETING_VERSION: "1.1"
-        CURRENT_PROJECT_VERSION: "1.1"
+        MARKETING_VERSION: "3.6"
+        CURRENT_PROJECT_VERSION: "2609201017"
         # System Extension 类型(不是普通 appex)
         PACKAGE_TYPE: SYSX
         WRAPPER_EXTENSION: systemextension
