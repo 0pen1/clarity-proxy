@@ -81,8 +81,10 @@ final class ConfigXPCServer: NSObject, NSXPCListenerDelegate {
         let path = String(cString: buf)
         let allowed = "/Applications/NetProxy.app/Contents/MacOS/NetProxy"
         if path == allowed { return true }
-        // Xcode 调试构建: DerivedData 路径也放行（同一构建链,真机调试）
-        if path.contains("DerivedData") && path.hasSuffix("/NetProxy") { return true }
+        // 调试构建放行（同一构建链,真机调试）:Xcode DerivedData 与本地
+        // XcodeProj/build 两种产物路径
+        if path.hasSuffix("/NetProxy") &&
+            (path.contains("DerivedData") || path.contains("XcodeProj/build/")) { return true }
         log.error("ConfigXPC: client path not trusted: \(path, privacy: .public)")
         return false
     }

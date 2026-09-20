@@ -182,9 +182,10 @@ enum ApplyEvent {
     case hotReloadFallback                 // sendMessage 未获回执，落回重启隧道路径
     case hotReloadXPC                      // ConfigXPC 直连命中（公证版主通道）
     case staleProvider(pid: Int32, etime: String)  // 扩展进程早于本次 start，NESM 将复用
-    case waitTimeout                       // 15s 内未 connected（僵尸 provider 特征）
+    case coldStartRetry                    // 冷启失败一次，自动 stop→start 重试（开机竞态常见）
+    case waitTimeout                       // 重试后仍未 connected（NESM 状态机卡死）
     case stopTimeout                       // stopVPNTunnel 后 10s 未 disconnected
-    case startProxyMissing                 // connected 但 startProxy 未执行（僵尸特征）
+    case startProxyMissing                 // 重试后 connected 但 startProxy 未执行（NESM 卡死）
     case started(pids: [Int], include: [String], tree: Bool, argInclude: [String])
     case stopped
 }
@@ -387,12 +388,14 @@ enum ProxyCtl {
                 print("✓ hot-reloaded via XPC (match 见扩展日志) — provider 未重启，规则即时生效")
             case .hotReloadFallback:
                 print("⚠️  sendMessage 热更未获回执——回退到重启隧道路径")
+            case .coldStartRetry:
+                print("⚠️  冷启未就绪——自动 stop→start 重试一轮（开机竞态常见）")
             case .staleProvider(let pid, let etime):
                 print("⚠️  检测到运行中的扩展进程（pid \(pid)，已存活 \(etime)）——")
                 print("   它早于本次 start，NESM 将复用它且不会加载新配置。")
                 print("   强烈建议先: sudo kill -9 \(pid) && sleep 2  再 start（本命令未自动执行，需要 sudo）")
             case .waitTimeout:
-                print("⚠️  proxy started 但 15s 内未 connected——僵尸 provider 特征：")
+                print("⚠️  重试后仍未 connected——NESM 状态机卡死：")
                 print("   1) 重试: $APP stop && sleep 5 && $APP start ...")
                 print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
                 print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
@@ -403,8 +406,8 @@ enum ProxyCtl {
                 print("   2) 无效则: sudo pkill -9 -f local.netproxy  再重试")
                 print("   3) 仍无效: 重启 Mac（NESM/内核状态机卡死唯一解）")
             case .startProxyMissing:
-                print("⚠️  connected 但 provider 未执行 startProxy（配置未加载）——")
-                print("   NESM 复用了旧 provider 进程。处置同上：pkill 后重试，或重启 Mac。")
+                print("⚠️  重试后 connected 但 provider 未执行 startProxy（配置未加载）——")
+                print("   NESM 状态机卡死。处置同上：pkill 后重试，或重启 Mac。")
             case .started(let pids, let include, let tree, let argInclude):
                 print("proxy started (match: pids=\(pids) include=\(include) tree=\(tree))")
                 // 旧行为保留:第二行打印本次 CLI 参数的 include(非合并列表)——逐字对齐
@@ -618,27 +621,48 @@ enum ProxyCtl {
 
             await ProxyCtl.checkStaleProvider(report: report)
 
-            try manager.connection.startVPNTunnel()
-
-            // 2. 等 connected（startVPNTunnel 只是请求，隧道真正起来需要时间）。
-            let connected = await ProxyCtl.waitConnected(timeout: 15)
-            guard connected else {
-                report(.waitTimeout)
-                return
+            // 冷启：startVPNTunnel → waitConnected → verifyStartProxyLogged。
+            // 失败自动重试一轮（stop→start 清 NESM 状态机）：开机竞态下 NESM
+            // 自动拉起失败后状态机滞后，首轮 15s 超时是常态（真机 2026-09-19
+            // 开机实录），停一下再启即恢复——不重试会误报"僵尸 provider"。
+            // 两轮都失败才是 NESM 状态机卡死（waitTimeout/startProxyMissing
+            // /stopTimeout 上报，GUI 建议重启 Mac）。
+            var startedOK = false
+            for attempt in 1...2 {
+                if attempt == 2 {
+                    report(.coldStartRetry)
+                    // connected 时直接 start 会被 NESM skip，先停；
+                    // stop 也卡死则状态机无救，放弃。
+                    let isConnected = manager.connection.status == .connected
+                    if isConnected {
+                        if !(await ProxyCtl.stopTunnelAndWait(manager: manager, report: report)) {
+                            return
+                        }
+                    }
+                }
+                try manager.connection.startVPNTunnel()
+                // 2. 等 connected（startVPNTunnel 只是请求，隧道真正起来需要时间）。
+                let connected = await ProxyCtl.waitConnected(timeout: 15)
+                guard connected else {
+                    if attempt == 2 { report(.waitTimeout); return }
+                    continue
+                }
+                // 3. 端到端验证：startProxy 是否真的加载了新配置——看 provider 日志里
+                //    本次 start 之后是否出现 "starting:" 行（Logger 需 --info --debug 落盘，
+                //    这里用 subprocess 直接查 log store）。以本次 start 的时刻为界：
+                //    NESM 复用已连接 provider 时 startVPNTunnel 是 no-op（"Skip a start
+                //    command: session in state connected"），老进程的旧 starting: 行
+                //    仍在 log store 里——只认 start 时间点之后的新行，否则假成功。
+                if await ProxyCtl.verifyStartProxyLogged(since: startWallClock) {
+                    startedOK = true
+                    break
+                }
+                if attempt == 2 { report(.startProxyMissing); return }
             }
-            // 3. 端到端验证：startProxy 是否真的加载了新配置——看 provider 日志里
-            //    本次 start 之后是否出现 "starting:" 行（Logger 需 --info --debug 落盘，
-            //    这里用 subprocess 直接查 log store）。以本次 start 的时刻为界：
-            //    NESM 复用已连接 provider 时 startVPNTunnel 是 no-op（"Skip a start
-            //    command: session in state connected"），老进程的旧 starting: 行
-            //    仍在 log store 里——只认 start 时间点之后的新行，否则假成功。
-            let startingOK = await ProxyCtl.verifyStartProxyLogged(since: startWallClock)
-            if !startingOK {
-                report(.startProxyMissing)
-                return
+            if startedOK {
+                report(.started(pids: mergedPids, include: mergedInclude, tree: effTreeMode,
+                                argInclude: patch.addInclude))
             }
-            report(.started(pids: mergedPids, include: mergedInclude, tree: effTreeMode,
-                            argInclude: patch.addInclude))
         } else {
             report(.stopped)
         }
@@ -738,8 +762,12 @@ enum ProxyCtl {
     /// 复用进程时老 starting: 行仍在 log store——必须按时间戳过滤（--start 时刻
     /// 之后的行才算数），否则热更 fallback 后的复用 no-op 也报成功。
     static func verifyStartProxyLogged(since: Date) async -> Bool {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime]
+        // log show --start 只认本地时区格式 "YYYY-MM-DD HH:MM:SS";ISO8601 带 Z
+        // 会被静默忽略并返回空结果(真机 2026-09-20 定案)——此前一切"僵尸 provider"
+        // 误报源于此。用 DateFormatter local 生成。
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        fmt.timeZone = TimeZone.current
         let sinceStr = fmt.string(from: since)
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
@@ -1197,8 +1225,10 @@ final class AppState: ObservableObject {
             toast = "⚠️ 热更未获回执——已回退重启隧道"
         case .staleProvider(let pid, let etime):
             toast = "⚠️ 检测到旧扩展进程 pid \(pid)（存活 \(etime)），建议 sudo kill -9 \(pid)"
+        case .coldStartRetry:
+            toast = "冷启未就绪，正在自动重试（stop→start）…"
         case .waitTimeout, .startProxyMissing, .stopTimeout:
-            toast = "⚠️ 僵尸 provider 特征——停止后重试，或 sudo pkill -9 -f local.netproxy"
+            toast = "⚠️ NESM 状态机卡死——已自动重试无效：pkill -9 -f local.netproxy 后重试，或重启 Mac"
         case .started(let pids, _, _, _):
             toast = "✓ 启动成功（监控 pid: \(pids)）"
         case .stopped:

@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.6 (2026-09-20)
+
+- **冷启自动重试（开机竞态自愈）**：apply() 冷启路径改两轮制——首轮 startVPNTunnel→waitConnected(15s) 失败后自动 stop→start 重试一轮（会话 connected 时 NESM 对 startVPNTunnel 是 skip no-op，先停才有效；stop 卡死则直接放弃）。开机竞态下 NESM 自动拉起失败后状态机滞后，首轮 15s 超时是常态（真机 2026-09-19 开机实录），不重试会误报「僵尸 provider」。两轮都失败才上报 waitTimeout/startProxyMissing/stopTimeout，文案从「僵尸 provider」改口「NESM 状态机卡死」（GUI 建议重启 Mac）。新增 ApplyEvent.coldStartRetry，CLI/GUI 双端同步。
+- **log show 时区坑定案（真机 2026-09-20）**：`log show --start` 只认本地时区格式 `YYYY-MM-DD HH:MM:SS`，ISO8601 带 Z 被静默忽略并返回空——verifyStartProxyLogged 永远查不到 starting: 行，此前一切「僵尸 provider」误报的真正根源。改用 DateFormatter 本地时区生成。
+- ConfigXPC 可信客户端路径增加 `XcodeProj/build/` 放行（本地 xcodebuild 产物真机调试，与 DerivedData 同一构建链语义）。
+
 ## 3.5 (2026-09-18)
 
 - **XPC 热更通道（公证版根治）**：解剖同机 Proxifier 3.15 实证其规则热更不走 NE IPC（3 天 NESM 日志零拒绝、Data 隧道零重启），而是宿主 ↔ root 扩展进程自建 NSXPC 直连（扩展 Info.plist `NEMachServiceName` + 双端自建 XPC 栈 `XPCClientForExtension`/`XPCServerInExtension`，方法表 `updateSettingWithSettings:profile:reply:`）。NetProxy 照抄架构：扩展侧 `ConfigXPC.swift`（listener = TeamID.扩展bundleID，proc_pidpath 校验连接方防 root 提权），宿主侧 `ConfigXPCClient.push`（2s 超时竞速）。apply() 热更链重排：① XPC 直连（公证版主通道）→ ② sendMessage（Development 有效）→ ③ 冷启兜底。详见 GUIDE §9 / 坑 20。
