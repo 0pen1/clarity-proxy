@@ -11,7 +11,7 @@
 #   - 本地 ~/Desktop/homebrew-tap 或 $TAP_DIR 指向 tap 仓库 clone
 #
 # 流程：
-#   1. bump ext-Info.plist 版本（CFBundleShortVersionString + CFBundleVersion 同步递增）
+#   1. bump 版本（宿主 + 扩展两个 Info.plist 同步：CFBundleShortVersionString + CFBundleVersion）
 #   2. xcodegen 工程沿用现有 pbxproj（不重新 generate——避免占位符/Team ID 丢失）
 #   3. notarize.sh：嵌套签名（dylib→sysex→host，devid profile）→ ditto → submit → staple
 #   4. ditto 打 staple 后 zip → gh release create（tag v<版本>）
@@ -31,8 +31,11 @@ echo "  clarity-proxy release v$VER (build $BUILD)"
 echo "════════════════════════════════════════════"
 
 echo "── [1/6] bump 版本 → $VER/$BUILD"
+# 宿主 + 扩展同步 bump（此前只 bump ext——宿主 GUI 头一直显示 v1.1，版本错位）
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" XcodeProj/netproxy/ext-Info.plist
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" XcodeProj/netproxy/ext-Info.plist
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" XcodeProj/netproxy/Info.plist
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" XcodeProj/netproxy/Info.plist
 
 echo "── [2/6] 构建（复用现有 pbxproj——不重新 generate）"
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
@@ -106,7 +109,7 @@ PYEOF
 
 # commit 本仓库的版本号 bump（rebase 对齐远端——与 tap 同款防覆盖）
 git pull --rebase -q origin main 2>/dev/null || true
-git add XcodeProj/netproxy/ext-Info.plist
+git add XcodeProj/netproxy/ext-Info.plist XcodeProj/netproxy/Info.plist
 git commit -q -m "release: v$VER (build $BUILD)" || true
 git push -q 2>/dev/null || git push
 
