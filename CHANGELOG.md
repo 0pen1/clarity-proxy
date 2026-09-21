@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.7 (未发布)
+
+- **测试基建（零测试 → 34 case 全绿）**：`Shared/ProxyCore.swift` 把 ProcInfo/FilterRule/ProxyConfig/ProxyPatch/ConfigMerge 抽为纯 Foundation 共享源——Host 与扩展的配置字典解析合并为 `ProxyConfig.parse` 单一来源（3.6.1 的「includePids 空数组=显式清空」等语义定案由测试锁死）。`Tests/ProxyCoreTests.swift` 34 case：FilterRule 匹配全语义（tree/pid/truncated 降级/回环防护/系统白名单）、配置 round-trip 与两态兼容、merge 语义（含清扫空集落字典）。test bundle 独立运行（不依赖宿主 app——CLI/GUI 双态 `main()` 当 test host 会把 xctest 参数当命令 exit(2)）。跑法：`xcodebuild -scheme ProxyCoreTests test`。
+- **GUI 路径规则可见可删**：监控区从只显示 pid 扩展为 pid + include 路径规则 + exclude 排除规则三类（CLI 建立的 `--include`/`--exclude` 规则此前在 GUI 不可见）；删除走热更通道秒生效。
+- **`--remove-exclude`**：CLI 此前 exclude 只能加不能删（只能 `--fresh` 重建）——补上移除语义，与 GUI 删除按钮共用。
+- **一键安装 + GUI 首启激活引导**：README 换 brew URL 直装（免 tap/trust 两步，`brew install --cask "https://github.com/0pen1/homebrew-tap/raw/main/Casks/netproxy.rb"`）；GUI 检测扩展未激活时显示醒目引导卡（激活按钮直达，替代藏在 ⚙ 菜单的入口）；cask caveats 同步。NE 系统扩展的用户批准流程无法自动化（Apple 安全模型），这是可达的最简安装形态。
+
 ## 3.6.1 (2026-09-20)
 
 - **宿主版本号同步发版节奏**：release.sh bump 步骤同时更新宿主与扩展两个 Info.plist（此前只 bump ext——宿主 GUI 头一直显示 v1.1）。仓库现状一次性对齐 3.6.1（Info.plist / project.yml / pbxproj）。
