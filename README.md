@@ -20,12 +20,13 @@ AI agent 跑在你的 Mac 上，它调用的每个子进程都在联网。clarit
 ## Install (Homebrew)
 
 ```bash
-brew tap 0pen1/tap https://github.com/0pen1/homebrew-tap
-brew trust 0pen1/tap
-brew install --cask netproxy
-# One-time activation (manual, requires admin approval):
-/Applications/NetProxy.app/Contents/MacOS/NetProxy activate
+# 一条命令安装（URL 直装 cask，无需先 tap/trust；按提示确认一次即可）
+brew install --cask "https://github.com/0pen1/homebrew-tap/raw/main/Casks/netproxy.rb"
 ```
+
+装完打开 NetProxy.app（菜单栏盾牌图标）→ 点「激活系统扩展」→ 在系统设置批准——这是 NE 系统扩展的用户同意流程，任何安装方式都无法跳过（Apple 安全模型，Proxifier 等同类 app 相同）。
+
+已用过 tap 方式的用户照常升级：`brew update && brew upgrade --cask netproxy`。
 
 Releases are notarized (Developer ID + staple) — no Xcode or developer-account registration needed on the target machine.
 
@@ -53,7 +54,7 @@ cp -R XcodeProj/build/Build/Products/Debug/NetProxy.app /Applications/ && xattr 
 双击 `/Applications/NetProxy.app`（或 `open`）即启动菜单栏应用——无参数启动进 GUI，带参数启动仍是 CLI，两者共用同一控制面：
 
 - **状态灯**：绿=已连接，红=未激活/未配置，橙=连接中
-- **监控区**：点「+ 添加监控…」从运行中的进程列表选 pid（搜索支持名称/pid，root 进程只显示进程名）。点行即添加，删除按钮即时生效（热更通道，不重启代理）
+- **监控区**：点「+ 添加监控…」从运行中的进程列表选 pid（搜索支持名称/pid，root 进程只显示进程名）。点行即添加，删除按钮即时生效（热更通道，不重启代理）。CLI 建立的路径规则（`--include`/`--exclude`）同样显示于此并可删除（v3.7 起）
 - **出口**：直连 / SOCKS5 / 网关三档切换，SOCKS5 填 host:port 后点「应用」
 - **⚙ 菜单**：激活/停用系统扩展（首次激活弹系统设置批准）、卸载配置（确认对话框）、复制诊断命令
 

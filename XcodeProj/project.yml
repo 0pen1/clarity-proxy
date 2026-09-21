@@ -17,6 +17,7 @@ targets:
     platform: macOS
     sources:
       - path: ../Host/HostApp.swift
+      - path: ../Shared/ProxyCore.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.netproxy.3w73w8c23l
@@ -43,6 +44,7 @@ targets:
       - path: ../Sysex/UDPFlow.swift
       - path: ../Sysex/Provider.swift
       - path: ../Sysex/ConfigXPC.swift
+      - path: ../Shared/ProxyCore.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.netproxy.3w73w8c23l.extension
@@ -58,3 +60,17 @@ targets:
         OTHER_LDFLAGS: -lbsm
         LD_ENTRY_POINT: _main
         SWIFT_OBJC_BRIDGING_HEADER: netproxy/bridge.h
+  ProxyCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ../Tests/ProxyCoreTests.swift
+      # Shared 源直接编进 test bundle（同 module，无需 import；不依赖宿主 app
+      # ——纯 Foundation 逻辑无 NE 环境即可跑）
+      - path: ../Shared/ProxyCore.swift
+    # 注意：不依赖 NetProxy app——依赖会触发 xcodegen 设 TEST_HOST，而 NetProxy
+    # 的 main() 把 xctest 注入参数当 CLI 命令解析后 exit(2)，测试 runner 无法 bootstrap。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.netproxy.3w73w8c23l.tests
+        GENERATE_INFOPLIST_FILE: YES

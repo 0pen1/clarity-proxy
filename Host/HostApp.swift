@@ -154,24 +154,8 @@ enum ConfigXPCClient {
 
 // MARK: - 类型化配置（CLI 与 GUI 共用）
 
-/// 一次配置变更的增量描述，与 CLI 参数语义一一对应：
-/// 默认 MERGE 到现有规则（pid/路径集合增删）；--fresh 整体重建；
-/// 连接参数（upstream/ipc）给一项就整组替换，未给沿用现有值。
-struct ProxyPatch {
-    var addInclude: [String] = []
-    var removeInclude: [String] = []
-    var addPids: [Int] = []
-    var removePids: [Int] = []
-    var addExclude: [String] = []
-    var treeMode: Bool? = nil
-    var upstreamMode: String? = nil
-    var upstreamHost: String? = nil
-    var upstreamPort: Int? = nil
-    var ipcPath: String? = nil
-    var ipcHost: String? = nil
-    var ipcPort: Int? = nil
-    var fresh = false
-}
+// ProxyPatch / ProxyConfig / ConfigMerge 在 Shared/ProxyCore.swift
+// （Host/Sysex 两 target 共用源文件；单测见 Tests/ProxyCoreTests.swift）
 
 /// apply 过程中的关键事件（回调顺序即发生顺序）。
 /// CLI 据此打印既有文案，GUI 据此驱动 toast/alert——两层共用同一事件流。
@@ -187,6 +171,7 @@ enum ApplyEvent {
     case stopTimeout                       // stopVPNTunnel 后 10s 未 disconnected
     case startProxyMissing                 // 重试后 connected 但 startProxy 未执行（NESM 卡死）
     case started(pids: [Int], include: [String], tree: Bool, argInclude: [String])
+    case sweptDeadPids([Int])                   // 清理掉的死 pid（启动/加删监控时扫描）
     case stopped
 }
 
@@ -203,6 +188,18 @@ struct ProxyStatus: Equatable {
     var exclude: [String]
     var pids: [Int]
     var treeMode: Bool
+}
+
+extension Int {
+    /// 进程存活判定：sysctl KERN_PROC_PID 查得到且非僵尸态（SZOMB）。
+    /// 与 ProxyCtl.apply 的死 pid 清理同语义（GUI 监控区「已退出」标记共用）。
+    var isAlive: Bool {
+        var kp = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(self)]
+        guard sysctl(&mib, 4, &kp, &size, nil, 0) == 0, size > 0 else { return false }
+        return kp.kp_proc.p_stat != SZOMB
+    }
 }
 
 // MARK: - 进程枚举（ProcessPicker 数据源）
@@ -412,6 +409,8 @@ enum ProxyCtl {
                 print("proxy started (match: pids=\(pids) include=\(include) tree=\(tree))")
                 // 旧行为保留:第二行打印本次 CLI 参数的 include(非合并列表)——逐字对齐
                 print("✓ verified: connected + startProxy loaded (config: pid=\(pids) include=\(argInclude))")
+            case .sweptDeadPids(let dead):
+                print("清理死进程: pid \(dead.map(String.init).joined(separator: ", ")) 已从监控列表移除")
             case .stopped:
                 print("proxy stopped (config saved, disabled)")
             }
@@ -442,6 +441,10 @@ enum ProxyCtl {
             case "--remove-include":
                 // 从现有 include 路径集合移除该子串。
                 if let v = it.next() { patch.removeInclude.append(v) }
+            case "--remove-exclude":
+                // 从现有 exclude 集合移除该子串（3.7：此前 exclude 加入后无法
+                // 移除，只能 --fresh 重建——CLI 与 GUI 删除排除规则共用本参数）。
+                if let v = it.next() { patch.removeExclude.append(v) }
             case "--exclude":
                 if let v = it.next() { patch.addExclude.append(v) }
             case "--fresh":
@@ -490,51 +493,35 @@ enum ProxyCtl {
         let oldProto = manager.protocolConfiguration as? NETunnelProviderProtocol
         let old = oldProto?.providerConfiguration ?? [:]
 
-        // 合并规则集合：fresh 或首次配置时以本次 patch 为基线；否则在现有集合上增删。
-        var mergedInclude: [String]
-        var mergedExclude: [String]
-        var mergedPids: [Int]
-        if patch.fresh || old.isEmpty {
-            mergedInclude = patch.addInclude
-            mergedExclude = patch.addExclude
-            mergedPids = patch.addPids
-        } else {
-            let oldInclude = (old["includeProcessPaths"] as? [String]) ?? []
-            let oldExclude = (old["excludeProcessPaths"] as? [String]) ?? []
-            let oldPids = ((old["includePids"] as? [NSNumber]) ?? []).map { $0.intValue }
-            mergedInclude = Array(Set(oldInclude).union(patch.addInclude))
-            mergedExclude = Array(Set(oldExclude).union(patch.addExclude))
-            mergedPids = Array(Set(oldPids).union(patch.addPids))
+        // 显式添加的死 pid：不进列表（missingPid 警告沿用旧文案语义——
+        // 「你要求加的这个 pid 不存在」；区别于下方清扫的「配置里遗留的死 pid」）。
+        var patch = patch
+        if !patch.addPids.isEmpty {
+            let deadAdds = patch.addPids.filter { !$0.isAlive }
+            for p in deadAdds { report(.missingPid(p)) }
+            patch.addPids.removeAll { deadAdds.contains($0) }
         }
-        for p in patch.removePids { mergedPids.removeAll { $0 == p } }
-        for s in patch.removeInclude { mergedInclude.removeAll { $0 == s } }
 
-        // 运行连接参数：给了一项就整体替换这一组；一项没给则沿用现有。
-        let oldUpstreamMode = (old["upstreamMode"] as? String) ?? "direct"
-        let oldUpstreamHost = (old["upstreamHost"] as? String) ?? "127.0.0.1"
-        let oldUpstreamPort = (old["upstreamPort"] as? Int) ?? 1080
-        let effUpstreamMode = patch.upstreamMode ?? oldUpstreamMode
-        let effUpstreamHost = patch.upstreamHost ?? oldUpstreamHost
-        let effUpstreamPort = patch.upstreamPort ?? oldUpstreamPort
-        let effIpcPath = patch.ipcPath ?? (old["ipcPath"] as? String)
-        let effIpcHost = patch.ipcHost ?? (old["ipcHost"] as? String)
-        let effIpcPort = patch.ipcPort ?? (old["ipcPort"] as? Int)
-        // treeMode：本次给了 --include-tree 置 true；--fresh 时按本次（无 tree 即 false）；
-        // 否则沿用现有 true（一旦开过树匹配,merge 场景保持,避免第二次 start 静默关闭）。
-        let oldTreeMode = (old["treeMode"] as? Bool) ?? false
-        let effTreeMode = patch.treeMode ?? (patch.fresh ? false : oldTreeMode)
+        // merge 纯逻辑核（Shared/ProxyCore.swift，单测锁定语义）：
+        // 集合 union/removeAll、fresh 重建、upstream 整组替换、treeMode 粘性。
+        var merged = ConfigMerge.apply(old: old, patch: patch)
 
-        if effUpstreamMode == "gk" && effIpcPath == nil && effIpcHost == nil {
+        // 死 pid 清理：启动/添加/删除监控都会走到这里（apply 唯一入口，CLI 与
+        // GUI 三动作共用）。已退出的进程留在列表里永远不命中流量（祖先链 pid
+        // 匹配不到），只会让 GUI 监控区积累「僵尸行」——统一扫一遍移除。
+        // 只在 enable 路径扫：stop 保留配置不动（用户可能保留监控下次启动续用）。
+        // p_stat == SZOMB 是僵尸态（父进程未收尸）——命中的规则同样失效，一并清。
+        if enable, !merged.pids.isEmpty {
+            let dead = merged.pids.filter { !$0.isAlive }
+            if !dead.isEmpty {
+                merged.pids.removeAll { dead.contains($0) }
+                report(.sweptDeadPids(dead))
+            }
+        }
+
+        if merged.upstreamMode == "gk" && merged.ipcPath == nil && merged.ipcHost == nil {
             report(.badConfig("--upstream gk 需要 --ipc <socket-path> 或 --ipc-tcp 127.0.0.1:<port>"))
             return
-        }
-        for p in mergedPids {
-            var kp = kinfo_proc()
-            var size = MemoryLayout<kinfo_proc>.size
-            var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(p)]
-            if sysctl(&mib, 4, &kp, &size, nil, 0) != 0 || size == 0 {
-                report(.missingPid(p))
-            }
         }
 
         let proto = NETunnelProviderProtocol()
@@ -542,18 +529,7 @@ enum ProxyCtl {
         proto.serverAddress = "local.clarity"
         // 注意:这里不能放机密,Apple 会把 providerConfiguration 记进系统日志
         // (socket 路径/回环地址非机密,明文无妨)
-        var conf: [String: Any] = [
-            "includeProcessPaths": mergedInclude,
-            "excludeProcessPaths": mergedExclude,
-            "upstreamMode": effUpstreamMode,
-            "upstreamHost": effUpstreamHost,
-            "upstreamPort": effUpstreamPort,
-        ]
-        conf["treeMode"] = effTreeMode
-        if !mergedPids.isEmpty { conf["includePids"] = mergedPids }
-        if let p = effIpcPath { conf["ipcPath"] = p }
-        if let h = effIpcHost { conf["ipcHost"] = h }
-        if let p = effIpcPort { conf["ipcPort"] = p }
+        let conf = merged.toDictionary()
         proto.providerConfiguration = conf
         manager.protocolConfiguration = proto
         manager.localizedDescription = "NetProxy"
@@ -599,8 +575,8 @@ enum ProxyCtl {
                            let ackDict = ackObj as? [String: Any],
                            ackDict["ok"] as? Bool == true {
                             let matchDesc = "\(ackDict["match"] ?? "?")"
-                            report(.hotReloaded(match: matchDesc, pids: mergedPids,
-                                                include: mergedInclude, tree: effTreeMode))
+                            report(.hotReloaded(match: matchDesc, pids: merged.pids,
+                                                include: merged.include, tree: merged.treeMode))
                             return
                         }
                     }
@@ -660,7 +636,7 @@ enum ProxyCtl {
                 if attempt == 2 { report(.startProxyMissing); return }
             }
             if startedOK {
-                report(.started(pids: mergedPids, include: mergedInclude, tree: effTreeMode,
+                report(.started(pids: merged.pids, include: merged.include, tree: merged.treeMode,
                                 argInclude: patch.addInclude))
             }
         } else {
@@ -950,6 +926,9 @@ final class AppState: ObservableObject {
     @Published var lastActionText = "—"
     @Published var statusDetail: ProxyStatus? = nil
     @Published var pickerRequested = false
+    // 首启引导：扩展完全未登记（discover 空）= 用户还没走过 activate + 批准。
+    // 与 statusDetail==nil（已激活但无隧道配置）区分——后者只是没配置，不弹引导。
+    @Published var needsActivation = false
 
     var onIconChange: ((String) -> Void)? = nil
 
@@ -993,13 +972,24 @@ final class AppState: ObservableObject {
                 let s = try await ProxyCtl.readStatus()
                 hostLog.info("refreshNow 成功 enabled=\(s?.enabled ?? false)")
                 self.applyStatus(s)
+                self.needsActivation = false
             } catch is NEWatchdogError {
                 self.recoverFromNEHang()
             } catch {
                 hostLog.error("refreshNow 异常 \(String(describing: error))")
                 self.applyStatus(nil)
+                await self.checkNeedsActivation()
             }
         }
+    }
+
+    /// 区分「未激活」与「已激活未配置」：readStatus 失败（无隧道配置）时查
+    /// OSSystemExtensionManager 的登记状态——discover 空 = 扩展从未激活过，
+    /// 弹首启引导；非空 = 只是没配置（保持原有安静提示，不打扰）。
+    /// discover 本身挂起/异常按未激活处理不了——保守不弹（宁缺勿假）。
+    private func checkNeedsActivation() async {
+        let lines = await SysexInstaller.shared.discover()
+        needsActivation = !lines.contains { $0.hasPrefix("found: ") }
     }
 
     /// 常驻 keepalive（v3 治本）：45s 一次 status 查询。NE 框架的进程内 XPC
@@ -1147,6 +1137,38 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 删 include 路径规则（merge 语义的 --remove-include）。
+    func doRemoveInclude(_ substr: String) {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.apply(patch: ProxyPatch(removeInclude: [substr]), enable: true) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "移除规则失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// 删 exclude 排除规则（merge 语义的 --remove-exclude，3.7）。
+    func doRemoveExclude(_ substr: String) {
+        guard !busy else { return }
+        busy = true
+        Task { @MainActor in
+            defer { busy = false; refreshNow() }
+            do {
+                try await ProxyCtl.apply(patch: ProxyPatch(removeExclude: [substr]), enable: true) { event in
+                    Task { @MainActor in self.handleEvent(event) }
+                }
+            } catch {
+                toast = "移除排除失败: \(error.localizedDescription)"
+            }
+        }
+    }
+
     /// 改出口：三项给全才替换（与 CLI "给一项就整组替换"语义一致——GUI 要求全项，
     /// 避免半改状态）。未启动时自动 start。校验在 UpstreamSection 内做，这里兜底。
     func doApplyUpstream(mode: String, host: String, port: Int) {
@@ -1181,6 +1203,7 @@ final class AppState: ObservableObject {
             do {
                 try await SysexInstaller.shared.activate()
                 toast = "系统扩展 active"
+                needsActivation = false
             } catch {
                 toast = "激活失败: \(error.localizedDescription)"
             }
@@ -1235,6 +1258,9 @@ final class AppState: ObservableObject {
             toast = "已停止"
         case .missingPid(let p):
             toast = "⚠️ pid \(p) 不存在——规则将不会命中任何流量"
+        case .sweptDeadPids(let dead):
+            let names = dead.map { "pid \($0)" }.joined(separator: "、")
+            toast = "已清理 \(dead.count) 个死进程（\(names)）"
         case .badConfig(let msg):
             toast = "✗ \(msg)"
         }
@@ -1284,8 +1310,29 @@ struct RootView: View {
                 }
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
+            } else if state.needsActivation {
+                // 首启引导（brew 装完第一次打开即见）：激活按钮直接给到,
+                // 不再藏在 ⚙ 菜单——NE 系统扩展的批准流程无法自动化,
+                // 这一步点击是用户唯一的必经动作,引导越短越好。
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("第一步：激活系统扩展", systemImage: "1.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                    Text("点击下方按钮,然后在「系统设置 → 隐私与安全性」里点「允许」。批准后面板自动刷新。")
+                        .font(.caption).foregroundColor(.secondary)
+                    Button {
+                        state.doActivate()
+                    } label: {
+                        Label("激活系统扩展", systemImage: "checkmark.shield.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .controlSize(.large)
+                    .disabled(state.busy)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
             } else {
-                Text("扩展未激活——⚙ 菜单 →「激活系统扩展」，批准后回来自动刷新")
+                Text("扩展已激活但未配置——点「启动代理」开始,或先用 CLI 添加监控规则")
                     .font(.caption).foregroundColor(.secondary)
             }
             Divider()
@@ -1421,7 +1468,9 @@ struct UpstreamSection: View {
 
 // MARK: - 监控区
 
-/// 监控列表：pid 行（进程名 + 删除按钮）+ [+ 添加监控] 按钮。
+/// 监控列表：pid 行 + include/exclude 路径规则行 + [+ 添加监控] 按钮。
+/// 路径规则来自 CLI 的 --include/--include-tree/--exclude（3.7 前仅 CLI 可见，
+/// GUI 现补齐查看与删除；删除走热更通道，与 pid 删除同一 merge 语义）。
 struct MonitorSection: View {
     @ObservedObject var state: AppState
 
@@ -1438,10 +1487,14 @@ struct MonitorSection: View {
                 .keyboardShortcut("n", modifiers: .command)
                 .help("从运行中的进程选择要监控的 pid（进程树语义，含未来子进程）⌘N")
             }
-            let pids = state.statusDetail?.pids ?? []
-            if pids.isEmpty {
+            let d = state.statusDetail
+            let pids = d?.pids ?? []
+            let includes = d?.include ?? []
+            let excludes = d?.exclude ?? []
+            if pids.isEmpty && includes.isEmpty && excludes.isEmpty {
                 Text("未配置监控规则").font(.caption).foregroundColor(.secondary)
             } else {
+                // pid 监控行
                 ForEach(pids, id: \.self) { pid in
                     HStack {
                         Image(systemName: "scope")
@@ -1449,6 +1502,12 @@ struct MonitorSection: View {
                             .font(.caption)
                         Text("pid \(pid)")
                             .font(.system(size: 11, design: .monospaced))
+                        // 进程已退出（下次启动/加删监控时自动清理）
+                        if !pid.isAlive {
+                            Text("已退出")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
                         Spacer()
                         Button(action: { state.doRemovePid(pid) }) {
                             Image(systemName: "xmark.circle.fill")
@@ -1457,6 +1516,50 @@ struct MonitorSection: View {
                         .buttonStyle(.plain)
                         .disabled(state.busy)
                         .help("停止监控该 pid（热更秒生效）")
+                    }
+                }
+                // include 路径规则行（CLI --include / --include-tree 建立）
+                ForEach(includes, id: \.self) { pat in
+                    HStack {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .foregroundColor(.accentColor)
+                            .font(.caption)
+                        Text(pat)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                        Spacer()
+                        Button(action: { state.doRemoveInclude(pat) }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(state.busy)
+                        .help("移除该路径规则（热更秒生效）")
+                    }
+                }
+                // exclude 排除规则行（CLI --exclude 建立，匹配时优先放行）
+                ForEach(excludes, id: \.self) { pat in
+                    HStack {
+                        Image(systemName: "minus.circle")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                        Text(pat)
+                            .font(.system(size: 11, design: .monospaced))
+                            .strikethrough()
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                        Text("排除")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button(action: { state.doRemoveExclude(pat) }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(state.busy)
+                        .help("移除该排除规则（热更秒生效）")
                     }
                 }
             }
@@ -1644,6 +1747,7 @@ struct HostApp {
                               [--include-pid PID]...           精确子树(可多次,叠加监控)
                               [--remove-pid PID]...            从监控集合移除
                               [--remove-include SUBSTR]...
+                              [--remove-exclude SUBSTR]...
                               [--exclude SUBSTR]...
                               [--fresh]                        忽略现有规则,从本次命令行重建
                               [--upstream socks5://host:port | gk | direct]

@@ -7,22 +7,8 @@ let log = Logger(subsystem: "local.clarity", category: "extension")
 
 private let PROC_PIDPATHINFO_MAXSIZE: UInt32 = UInt32(MAXPATHLEN * 4)
 
-// MARK: - 进程信息(内存缓存,按 audit token)
-
-struct ProcInfo {
-    var pid: UInt32
-    var path: String?
-    // 祖先进程路径链(发起进程 → pid 1,含发起进程自身)。NE 的 audit token
-    // 只标识发起连接的进程,进程树语义靠这里展开:连接发起时实时回溯 ppid,
-    // 子进程(Claude 调 bash 跑 curl 等)的祖先链天然包含 claude。
-    // 链不完整(祖先已退出/孤儿挂 launchd/超限)时 truncated=true,匹配语义降级。
-    var ancestors: [String] = []
-    // 与 ancestors 对齐的 pid 链(ancestors[i] 的进程 pid = ancestorPids[i])。
-    // --include-pid 按祖先 pid 精确匹配子树,零误伤(路径 contains 会命中
-    // 其他 claude 实例;pid 是唯一标识)。
-    var ancestorPids: [UInt32] = []
-    var truncated: Bool = false
-}
+// ProcInfo / FilterRule / ProxyConfig / ProxyPatch / ConfigMerge 在 Shared/ProxyCore.swift
+// （Host/Sysex 两 target 共用源文件；单测见 Tests/ProxyCoreTests.swift）
 
 final class ProcInfoCache {
     static let shared = ProcInfoCache()
@@ -82,67 +68,6 @@ final class ProcInfoCache {
             cur = kp.kp_eproc.e_ppid
         }
         return (paths, pids, truncated)
-    }
-}
-
-// MARK: - 进程过滤配置
-
-struct FilterRule {
-    // 进程树匹配模式:
-    //   false(默认)= 旧语义,仅发起连接的进程 path.contains(include)
-    //   true  = 祖先链任一命中(include-tree)——Claude 调工具的子进程流量全覆盖。
-    //           链不完整(truncated)时降级为保守策略:视为不匹配放行(避免误伤
-    //           正常孤儿进程),审计可见 ancestry_incomplete。
-    var treeMode = false
-    // nil = 全部拦截
-    var includePaths: [String] = []
-    var excludePaths: [String] = []
-    // --include-pid:祖先链 pid 精确匹配——只拦指定进程及其枝干,零误伤
-    // (路径 contains 会命中其他 claude 实例;pid 是唯一标识,重用窗口极小)。
-    // 非空时按 pid 匹配,忽略 includePaths(两种树匹配互斥,pid 优先)。
-    var includePids: [UInt32] = []
-    // 始终放行本扩展自身与系统关键进程
-    private let alwaysExclude = [
-        "/System/",
-        "/usr/libexec/",
-        "/usr/sbin/",
-        "/sbin/",
-    ]
-    // gatekeeper 数据面进程必须无条件放行(含 tree 模式):树匹配会把它
-    // 也圈进 claude 祖先链(从 claude 的 shell 启动)→ gatekeeper 出网回环
-    // 被自己截获 → 死循环。按路径 contains 排除。
-    private let infraExclude = [
-        "gatekeeper",
-        "/local.clarity.",
-        "/NetProxy.app/",
-    ]
-
-    func shouldIntercept(_ info: ProcInfo) -> Bool {
-        guard let path = info.path else { return false }
-        // gatekeeper/扩展自身:无条件放行(回环防护,任何模式)
-        if infraExclude.contains(where: { path.contains($0) }) { return false }
-        // 祖先链里也查:数据面 dialOut 的发起进程是 gatekeeper 本身,上面已放行;
-        // 这里再兜一层(比如改名部署)。
-        if treeMode && info.ancestors.contains(where: { anc in
-            infraExclude.contains { anc.contains($0) } }) { return false }
-        // 上游代理回环流量由 NENetworkRule 层面排除;此处兜底
-        if alwaysExclude.contains(where: { path.hasPrefix($0) }) && includePaths.isEmpty {
-            return false
-        }
-        if excludePaths.contains(where: { path.contains($0) }) { return false }
-        if !includePids.isEmpty {
-            // pid 树匹配:祖先链(含发起进程自身)的 pid 精确命中。
-            return info.ancestorPids.contains { p in includePids.contains(p) }
-        }
-        if includePaths.isEmpty { return true }
-        if treeMode {
-            // 祖先链任一命中即拦(含发起进程自身)。链不完整且未命中 → 放行
-            // (孤儿进程不误伤;真要全拦的用户用非 tree 模式全拦兜底)。
-            return info.ancestors.contains { anc in
-                includePaths.contains { pat in anc.contains(pat) }
-            }
-        }
-        return includePaths.contains(where: { path.contains($0) })
     }
 }
 
@@ -551,22 +476,22 @@ class Provider: BaseProvider {
     }
 
     /// providerConfiguration → 内存规则（startProxy 冷启与 handleAppMessage 热更共用）。
+    /// 解析委托 Shared/ProxyCore.swift 的 ProxyConfig.parse（单一来源，两端共享，
+    /// 键/类型/缺省语义由其单测锁定）。includePids 全量替换语义（含空数组=清空）：
+    /// Host 清扫死 pid 后推来的 conf 可能 includePids=[]——必须清掉内存旧集；
+    /// 缺键沿用旧值（防御旧版 Host 推半量字典）。
     private func applyConfig(_ conf: [String: Any]) {
-        if let inc = conf["includeProcessPaths"] as? [String] { filter.includePaths = inc }
-        if let exc = conf["excludeProcessPaths"] as? [String] { filter.excludePaths = exc }
-        if let m = conf["upstreamMode"] as? String { upstreamMode = m }
-        if let h = conf["upstreamHost"] as? String { socksHost = h }
-        if let p = conf["upstreamPort"] as? Int { socksPort = UInt16(clamping: p) }
-        if let s = conf["ipcPath"] as? String, !s.isEmpty { ipcPath = s }
-        if let h = conf["ipcHost"] as? String, !h.isEmpty { ipcHost = h }
-        if let p = conf["ipcPort"] as? Int, p > 0 { ipcPort = UInt16(clamping: p) }
-        if let t = conf["treeMode"] as? Bool { filter.treeMode = t }
-        else if let t = conf["treeMode"] as? Int { filter.treeMode = (t != 0) }
-        if let pids = conf["includePids"] as? [Int] {
-            filter.includePids = pids.map { UInt32(clamping: max(0, $0)) }
-        } else if let pids = conf["includePids"] as? [NSNumber] {
-            filter.includePids = pids.map { $0.uint32Value }
-        }
+        let c = ProxyConfig.parse(conf)
+        filter.includePaths = c.includePaths
+        filter.excludePaths = c.excludePaths
+        filter.treeMode = c.treeMode
+        filter.includePids = c.includePids
+        upstreamMode = c.upstreamMode
+        socksHost = c.upstreamHost
+        socksPort = c.upstreamPort
+        ipcPath = c.ipcPath
+        ipcHost = c.ipcHost
+        ipcPort = c.ipcPort
     }
 
     /// 运行时热更新（NEProvider.sendMessage 通道）：Host CLI 把**全量**新配置字典
