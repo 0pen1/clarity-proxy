@@ -32,9 +32,15 @@ echo "✓ 证书与产物就位"
 echo "=== 1. 嵌套签名（内 → 外：dylib → sysex → host）==="
 # 所有嵌套 dylib 逐个签（公证要求每个二进制独立 Developer ID + timestamp；
 # --deep 不覆盖 Frameworks 内的 dylib 签名——首次提交 Invalid 的根因）
+# Frameworks 目录可能不存在（部署目标 12+ 时 Xcode 不再内嵌 back-deploy 的
+# libswift_Concurrency.dylib——3.7 实测）；find 对缺失路径返回非零，
+# set -euo pipefail 会静默杀掉脚本（且外层管道吞掉非零退出码）——用
+# && 短路保护，目录缺失 = 没有 dylib 可签 = 直接跳过。
+[ -d "$APP/Contents/Frameworks" ] && \
 find "$APP/Contents/Frameworks" -name "*.dylib" 2>/dev/null | while read -r dylib; do
   codesign --force --sign "$CERT" --options runtime --timestamp "$dylib"
 done
+true  # 上面的 && 短路在目录缺失时整体为假——补 true 防止 set -e 误杀
 # sysex 签（devid entitlements + devid profile 背书——裸 Developer ID 签名
 # 带受限 entitlement 在非开发机上会被内核 SIGKILL（killed），必须嵌 profile）
 cp "$E/ext-devid.provisionprofile" "$SYSEX/Contents/embedded.provisionprofile"
