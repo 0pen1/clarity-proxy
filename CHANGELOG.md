@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.7 (未发布)
+## 3.7 (2026-09-22)
 
 - **测试基建（零测试 → 34 case 全绿）**：`Shared/ProxyCore.swift` 把 ProcInfo/FilterRule/ProxyConfig/ProxyPatch/ConfigMerge 抽为纯 Foundation 共享源——Host 与扩展的配置字典解析合并为 `ProxyConfig.parse` 单一来源（3.6.1 的「includePids 空数组=显式清空」等语义定案由测试锁死）。`Tests/ProxyCoreTests.swift` 34 case：FilterRule 匹配全语义（tree/pid/truncated 降级/回环防护/系统白名单）、配置 round-trip 与两态兼容、merge 语义（含清扫空集落字典）。test bundle 独立运行（不依赖宿主 app——CLI/GUI 双态 `main()` 当 test host 会把 xctest 参数当命令 exit(2)）。跑法：`xcodebuild -scheme ProxyCoreTests test`。
 - **GUI 路径规则可见可删**：监控区从只显示 pid 扩展为 pid + include 路径规则 + exclude 排除规则三类（CLI 建立的 `--include`/`--exclude` 规则此前在 GUI 不可见）；删除走热更通道秒生效。
