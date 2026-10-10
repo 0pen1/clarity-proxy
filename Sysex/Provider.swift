@@ -464,11 +464,24 @@ class Provider: BaseProvider {
                 localNetwork: nil, localPrefix: 0,
                 protocol: .any, direction: .outbound)
         ]
-        // 排除回环:上游 socks5 走 127.0.0.1,provider 自身连接必须能出去
+        // 排除回环:上游 socks5/gk IPC 全走 127.0.0.1,provider 自身连接必须能出去
+        // (坑 15:不排除 → provider 连上游被自己截获 → policy loop 死锁)。
+        // NENetworkRule 按 remotePrefix 匹配**网段**,NWHostEndpoint 的 port 不参与
+        // 匹配(真机实证:port "1" 但整个 127.0.0.1 全端口都排除了,socks5 7897
+        // 未死锁)——因此一条 /32 即覆盖全部 IPv4 回环端口,包括 gatekeeper 的
+        // 三个回环服务口:8443(CONNECT 代理 MITM 入口)/18446(NE 扩展 IPC,
+        // 生死口,被拦即整链瘫痪)/8445(申诉端点)。
+        // ::1/128 是 IPv6 回环,同样必须排除:上游配 [::1] 或本机服务双栈解析
+        // 到 ::1 时,漏排 = IPv6 侧 policy loop 死锁(此前缺口,3.7.1 补)。
         settings.excludedNetworkRules = [
             NENetworkRule(
                 remoteNetwork: NWHostEndpoint(hostname: "127.0.0.1", port: "1"),
                 remotePrefix: 32,
+                localNetwork: nil, localPrefix: 0,
+                protocol: .any, direction: .outbound),
+            NENetworkRule(
+                remoteNetwork: NWHostEndpoint(hostname: "::1", port: "1"),
+                remotePrefix: 128,
                 localNetwork: nil, localPrefix: 0,
                 protocol: .any, direction: .outbound),
         ]

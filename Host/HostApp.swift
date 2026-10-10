@@ -821,6 +821,15 @@ enum ProxyCtl {
         include: \(rawInclude)
         exclude: \(rawExclude)
         """)
+        // pid 匹配屏蔽提示（真机 2026-10-10：gatekeeper 机器上 pid:4156 占位时
+        // include 里的 curl 规则静默失效，用户误判为拦截故障）：
+        // FilterRule 定案语义 = includePids 非空时忽略 includePaths/excludePaths。
+        if !s.pids.isEmpty && (!s.include.isEmpty || !s.exclude.isEmpty) {
+            print("""
+            ⚠️  pid 匹配生效中——include/exclude 路径规则当前被屏蔽（两种匹配互斥，pid 优先）。
+                只拦 pid \(s.pids) 的进程树。要让路径规则生效: start --remove-pid <pid>
+            """)
+        }
     }
 }
 
@@ -1307,6 +1316,13 @@ struct RootView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("IPC: \(d.ipcDesc)")
                     Text("匹配: \(d.matchDesc)")
+                    // pid 匹配屏蔽提示：路径规则在列表里可见但实际不生效（定案语义
+                    // pid 优先），不提示则用户误判"加了规则却不拦"（真机 2026-10-10）
+                    if !d.pids.isEmpty && (!d.include.isEmpty || !d.exclude.isEmpty) {
+                        Label("路径规则被 pid 匹配屏蔽中——删除 pid 后生效", systemImage: "exclamationmark.triangle")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
                 }
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(.secondary)
