@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.7.1 (2026-10-10)
+
+- **IPv6 回环排除补缺口**：`excludedNetworkRules` 此前只排 `127.0.0.1/32`——上游配 `socks5://[::1]:…` 或本机服务双栈解析到 `::1` 时会在 IPv6 侧撞 policy loop 死锁（坑 15 的 IPv6 变体）。补 `::1/128`。回环排除注释文档化 gatekeeper 三端口（8443 MITM 入口 / 18446 NE IPC 生死口 / 8445 申诉端点）——`127.0.0.1/32` 网段级排除已覆盖（NENetworkRule 按网段匹配，port 不参与，真机实证）。
+- **pid 屏蔽路径规则提示**：includePids 非空时 include/exclude 路径规则整体失效（定案语义，pid 优先）——此前无任何提示，真机 2026-10-10 gatekeeper 部署时 pid:4156 占位导致 curl 规则静默失效被误判为拦截故障。现 `status` CLI 与 GUI 状态区在此状态下显式警示并给出 `--remove-pid` 修复命令。
+
 ## 3.7 (2026-09-22)
 
 - **测试基建（零测试 → 34 case 全绿）**：`Shared/ProxyCore.swift` 把 ProcInfo/FilterRule/ProxyConfig/ProxyPatch/ConfigMerge 抽为纯 Foundation 共享源——Host 与扩展的配置字典解析合并为 `ProxyConfig.parse` 单一来源（3.6.1 的「includePids 空数组=显式清空」等语义定案由测试锁死）。`Tests/ProxyCoreTests.swift` 34 case：FilterRule 匹配全语义（tree/pid/truncated 降级/回环防护/系统白名单）、配置 round-trip 与两态兼容、merge 语义（含清扫空集落字典）。test bundle 独立运行（不依赖宿主 app——CLI/GUI 双态 `main()` 当 test host 会把 xctest 参数当命令 exit(2)）。跑法：`xcodebuild -scheme ProxyCoreTests test`。
